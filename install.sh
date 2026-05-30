@@ -136,6 +136,26 @@ else
     host_protoc_bin="$inner/external/protobuf/install/bin"
     host_flatc_bin="$inner/external/flatbuffers/install/bin"
 
+    # --- Android liblog visibility ----------------------------------------------
+    # TFLite's `benchmark_model` target does `find_library(ANDROID_LOG_LIB log)`.
+    # Android's liblog lives in the read-only system image (/system/lib{,64}) and
+    # is NOT shipped as a linkable `liblog.so` in Termux's $PREFIX/lib, so the
+    # find fails with "set to NOTFOUND" and CMake's generate step aborts. Expose a
+    # linkable symlink in $PREFIX/lib (host == target, so the system lib is ABI
+    # compatible) so `-llog` resolves.
+    if [ -n "${PREFIX:-}" ] && [ ! -e "$PREFIX/lib/liblog.so" ]; then
+        case "$(uname -m)" in
+            aarch64|arm64|x86_64) sys_libdir="/system/lib64" ;;
+            *)                    sys_libdir="/system/lib"   ;;
+        esac
+        if [ -e "$sys_libdir/liblog.so" ]; then
+            ln -sf "$sys_libdir/liblog.so" "$PREFIX/lib/liblog.so" \
+                && info "Linked Android liblog ($sys_libdir/liblog.so) into \$PREFIX/lib for TFLite."
+        else
+            warn "Could not locate $sys_libdir/liblog.so; TFLite link of ANDROID_LOG_LIB may fail."
+        fi
+    fi
+
     cmake -B "$BUILD_DIR" -S "$SRC_DIR" -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release \
         -DLITERTLM_HOST_PROTOC="$host_protoc_bin/protoc" \
