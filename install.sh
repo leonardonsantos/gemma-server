@@ -182,6 +182,30 @@ else
         # No standalone libGLESv3.so on Android -> fall back to the v2 loader.
         link_system_lib libGLESv3    libGLESv3 libGLESv2   || warn "libGLESv3 not found; LiteRT GPU link may fail."
         link_system_lib libGLESv1_CM libGLESv1_CM          || true
+
+        # --- Stub archives for header-only INTERFACE targets --------------------
+        # Upstream LiteRT defines `litert_cc_options` (and the consumer bundle
+        # `litert_runtime_c_api_static`) as INTERFACE libraries, but several
+        # shared targets (libLiteRt.so, libLiteRtDispatch_*.so) list them in
+        # target_link_libraries. In this source-build configuration CMake emits
+        # them as plain link items (`-llitert_cc_options`); since an INTERFACE
+        # library produces no artifact, ld.lld fails with "unable to find
+        # library". The actual option symbols are compiled into `litert_cc_api`
+        # (linked separately) and `litert_c_options` is pulled in transitively via
+        # `litert_c_api`, so dropping empty, valid stub archives on the linker
+        # search path ($PREFIX/lib is on the default path — see the symlinks
+        # above) satisfies `-l<name>` harmlessly. When CMake does resolve the
+        # INTERFACE target correctly, the stub is simply never referenced.
+        _stub_obj="$(mktemp "${TMPDIR:-/tmp}/gemma_stub.XXXXXX.o")"
+        if echo 'static int _gemma_litert_stub;' | clang -x c -c -o "$_stub_obj" - 2>/dev/null; then
+            for _ilib in litert_cc_options litert_runtime_c_api_static; do
+                ar rcs "$PREFIX/lib/lib$_ilib.a" "$_stub_obj" 2>/dev/null \
+                    && info "Created stub lib$_ilib.a (header-only INTERFACE target)."
+            done
+        else
+            warn "Could not build INTERFACE stub archives; LiteRT shared-lib link may fail."
+        fi
+        rm -f "$_stub_obj"
     fi
 
     cmake -B "$BUILD_DIR" -S "$SRC_DIR" -G "Unix Makefiles" \
