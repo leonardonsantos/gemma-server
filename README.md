@@ -281,6 +281,8 @@ sudo swapon ~/swap/file
 |---|---|
 | Build killed (`Signal 9` / SEGFAULT) | Out of memory — add swap and/or lower `BUILD_JOBS=1`, then re-run |
 | `use of undeclared identifier 'pthread_cond_clockwait'` | A Rust crate (`cxx`) needs Android API 30 symbols. The installer pins the target to API 30; ensure your device is **Android 11+**, or set `GEMMA_ANDROID_API` to your device's level (≥ 30) |
+| Build fails just after `protobuf_external` | The installer points the native build's host `protoc`/`flatc` at the in-tree binaries (the upstream orchestrator otherwise targets a skipped prebuild dir). If you build manually, pass `-DLITERTLM_HOST_PROTOC=…/litert_lm/build/external/protobuf/install/bin/protoc` (and the matching `FLATC`) |
+| Build fails with a buried error | The full build output is saved to `~/.gemma-server/build.log`; the installer prints the key `error:` lines. For a single clear error, re-run with `BUILD_JOBS=1` |
 | Build fails midway | Re-run the installer; completed steps are skipped |
 | `Model not found` | Re-run to resume the download, or set `GEMMA_MODEL_FILE` |
 | `429 Busy` | Expected — one inference at a time; retry shortly |

@@ -124,8 +124,24 @@ EXISTING_BIN="$(find_built_binary || true)"
 if [ -n "$EXISTING_BIN" ] && [ "$REBUILD" != "1" ]; then
     info "Binary already built — skipping (set REBUILD=1 to force a rebuild)."
 else
+    # --- Native host-tool wiring -------------------------------------------------
+    # The orchestrator builds protoc/flatc in a "Host Prebuild" phase only when
+    # cross-compiling. On a native Termux build that phase is skipped, yet the
+    # orchestrator still defaults LITERTLM_HOST_PROTOC/FLATC to the (never built)
+    # prebuild directory. Proto/flatc codegen then fails right after
+    # `protobuf_external` builds. Since host == target here, point the host tools
+    # at the in-tree binaries the build itself produces (version-matched, runnable
+    # on-device). These paths mirror the ExternalProject BINARY_DIR layout.
+    inner="$BUILD_DIR/litert_lm/build"
+    host_protoc_bin="$inner/external/protobuf/install/bin"
+    host_flatc_bin="$inner/external/flatbuffers/install/bin"
+
     cmake -B "$BUILD_DIR" -S "$SRC_DIR" -G "Unix Makefiles" \
-        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLITERTLM_HOST_PROTOC="$host_protoc_bin/protoc" \
+        -DLITERTLM_HOST_PROTOC_BIN_DIR="$host_protoc_bin" \
+        -DLITERTLM_HOST_FLATC="$host_flatc_bin/flatc" \
+        -DLITERTLM_HOST_FLATC_BIN_DIR="$host_flatc_bin"
 
     # The build compiles Rust crates (cxx, llguidance) via cc-rs. cc-rs invokes
     # clang with `--target=aarch64-linux-android` (no API suffix), which resolves
@@ -143,7 +159,15 @@ else
     info "Compiling with -j${BUILD_JOBS} — grab a coffee (or two)…"
     # No -t: build the default `all` target, which drives the `litert_lm`
     # ExternalProject. The make jobserver propagates -j to the inner build.
-    cmake --build "$BUILD_DIR" -j"${BUILD_JOBS}"
+    # Tee to a log so the real compile error is recoverable (parallel builds bury
+    # it above the make failure cascade).
+    BUILD_LOG="$GEMMA_HOME/build.log"
+    if ! cmake --build "$BUILD_DIR" -j"${BUILD_JOBS}" 2>&1 | tee "$BUILD_LOG"; then
+        echo ""
+        warn "Build failed. Most relevant errors from the log:"
+        grep -nE 'error:|fatal error:|No rule to make|undeclared identifier|cannot find' "$BUILD_LOG" | tail -n 30 || true
+        error "Build failed — full log at $BUILD_LOG. Re-run to resume; for a clearer single error, retry with BUILD_JOBS=1."
+    fi
 fi
 
 BUILT_BIN="$(find_built_binary || true)"
