@@ -88,9 +88,10 @@ if command -v pkg >/dev/null 2>&1; then
     # zlib/openssl/libcurl: deps probed by CMake. python: the HTTP server. binutils/patch: misc.
     # libglvnd-dev: EGL/GLES/KHR headers for TFLite's GPU GL delegate (headers only;
     # Termux ships no EGL/egl.h otherwise, and the delegate is compiled unconditionally).
+    # vulkan-headers: <vulkan/vulkan.h> pulled in by the same GPU delegate (headers only).
     pkg install -y \
         clang cmake make ninja git rust python \
-        openjdk-17 zlib openssl libcurl binutils patch which curl libglvnd-dev
+        openjdk-17 zlib openssl libcurl binutils patch which curl libglvnd-dev vulkan-headers
 else
     warn "'pkg' not found — install equivalents of: clang cmake make ninja git rust python openjdk-17 zlib openssl libcurl"
 fi

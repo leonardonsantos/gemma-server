@@ -285,6 +285,7 @@ sudo swapon ~/swap/file
 | `ANDROID_LOG_LIB ... set to NOTFOUND` (TFLite `benchmark_model`) | Android's `liblog` lives in the read-only `/system/lib{,64}` and isn't linkable from `$PREFIX/lib`. The installer symlinks it into `$PREFIX/lib/liblog.so`; if building manually, run `ln -sf /system/lib64/liblog.so $PREFIX/lib/liblog.so` first |
 | `ANDROID_EGL_LIB` / `ANDROID_GLESV2_LIB` / `ANDROID_GLESV3_LIB ... set to NOTFOUND` (LiteRT runtime) | Same root cause for the GPU libs. The installer also symlinks `libEGL`/`libGLESv2`/`libGLESv3` from `/system/lib{,64}` into `$PREFIX/lib`; if building manually, `ln -sf /system/lib64/lib{EGL,GLESv2,GLESv3}.so $PREFIX/lib/` |
 | `fatal error: 'EGL/egl.h' file not found` (TFLite GPU GL delegate) | Termux ships no EGL/GLES headers but the GL delegate is compiled unconditionally. The installer adds the `libglvnd-dev` package (headers only); if building manually, run `pkg install -y libglvnd-dev` |
+| `fatal error: 'vulkan/vulkan.h' file not found` (TFLite GPU delegate) | Same delegate also needs Vulkan headers. The installer adds `vulkan-headers` (headers only); if building manually, run `pkg install -y vulkan-headers` |
 | Build fails with a buried error | The full build output is saved to `~/.gemma-server/build.log`; the installer prints the key `error:` lines. For a single clear error, re-run with `BUILD_JOBS=1` |
 | Build fails midway | Re-run the installer; completed steps are skipped |
 | `Model not found` | Re-run to resume the download, or set `GEMMA_MODEL_FILE` |
