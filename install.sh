@@ -86,9 +86,11 @@ if command -v pkg >/dev/null 2>&1; then
     pkg update -y
     # clang/cmake/make/ninja: build. git: clone. rust: llguidance. openjdk-17: ANTLR4.
     # zlib/openssl/libcurl: deps probed by CMake. python: the HTTP server. binutils/patch: misc.
+    # libglvnd-dev: EGL/GLES/KHR headers for TFLite's GPU GL delegate (headers only;
+    # Termux ships no EGL/egl.h otherwise, and the delegate is compiled unconditionally).
     pkg install -y \
         clang cmake make ninja git rust python \
-        openjdk-17 zlib openssl libcurl binutils patch which curl
+        openjdk-17 zlib openssl libcurl binutils patch which curl libglvnd-dev
 else
     warn "'pkg' not found — install equivalents of: clang cmake make ninja git rust python openjdk-17 zlib openssl libcurl"
 fi
