@@ -1,118 +1,173 @@
-# gemma-server — Gemma4-E2B OpenAI-compatible API for Termux
+# gemma-server — native Gemma on Termux via LiteRT-LM (CMake)
 
-Runs Google's **Gemma4-E2B** model on Android via Termux using LiteRT-LM, exposing an
-OpenAI-compatible HTTP API on port **8080**.  GPU acceleration is attempted automatically,
-with CPU fallback.
+Run Google's **Gemma** model natively on Android/Termux and expose an
+**OpenAI-compatible HTTP API** on port **8080**.
+
+Unlike the previous JVM/`kscript` approach, this version compiles the
+**native `litert_lm_main` binary on-device** using the official
+[LiteRT-LM **CMake Super-Build**](https://github.com/google-ai-edge/LiteRT-LM/blob/main/docs/getting-started/cmake.md).
+This avoids the glibc/Bionic incompatibility that forced CPU-only JVM fallbacks.
+
+> Background: the CMake build is the recommended path for Termux power users —
+> see [google-ai-edge/LiteRT-LM#2413](https://github.com/google-ai-edge/LiteRT-LM/issues/2413).
+> It is non-hermetic, probes the system, and links against Termux-native tools
+> (Clang 21, zlib, …) to produce a real `aarch64-linux-android` binary.
+
+---
+
+## Quick start
+
+One command. It installs the toolchain, compiles LiteRT-LM, downloads the model,
+and writes the HTTP server + launcher:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leonardonsantos/gemma-server/main/install.sh | bash
+```
+
+Then start the server:
+
+```bash
+gemma-server
+```
+
+Test it from a second Termux session:
+
+```bash
+curl http://localhost:8080/health
+```
+
+> ⏳ **The build takes several hours on-device** and needs **~5.5 GB RAM + swap**
+> and **~8 GB free storage**. The installer is fully **idempotent and resumable** —
+> if anything fails (network, OOM), just run it again and it skips completed steps.
+
+---
 
 ## Prerequisites
 
 | Requirement | Notes |
 |---|---|
-| Android device | ARM64, ≥ 6 GB RAM recommended |
-| [Termux](https://github.com/termux/termux-app) | Install from F-Droid (not Play Store) |
-| Java 21 | `pkg install openjdk-21` |
-| [kscript](https://github.com/kscripting/kscript) | Installed by `setup-termux.sh` |
-| Model file | `gemma-4-E2B-it.litertlm` (~2.58 GB) |
+| Android device | ARM64 (`aarch64`), ≥ 8 GB RAM recommended |
+| [Termux](https://github.com/termux/termux-app) | Install from **F-Droid** (not Play Store) |
+| Storage | ~8 GB free (model ≈ 2.6 GB + build tree) |
+| RAM + swap | ≥ 5.5 GB combined for the compile ([add swap](#adding-swap) if needed) |
+| Time | The native compile can take several hours |
+
+The installer `pkg install`s the rest automatically:
+`clang cmake make ninja git rust python openjdk-17 zlib openssl libcurl`.
 
 ---
 
-## Quick Start
+## What the installer does
 
-### 1. Bootstrap Termux environment
+`install.sh` runs these steps (each is skipped if already done):
 
-```bash
-bash setup-termux.sh
-```
+1. **Preflight** — checks architecture, free disk, RAM/swap, and picks a safe
+   `-j` value (`(RAM+swap)/8`, capped at CPU count) to avoid OOM-kills.
+2. **Toolchain** — `pkg install` of the build dependencies above.
+3. **Source** — clones `google-ai-edge/LiteRT-LM` into `~/.gemma-server/LiteRT-LM`.
+4. **Build** — the CMake Super-Build:
+   ```bash
+   cmake -B cmake/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20
+   cmake --build cmake/build -t litert_lm_main -j<N>
+   ```
+   The binary is copied to `~/.gemma-server/litert_lm_main`.
+5. **Model** — downloads `gemma-4-E2B-it.litertlm` (~2.6 GB, **resumable**) from
+   HuggingFace to `~/models/`.
+6. **Server** — writes `~/.gemma-server/gemma_server.py` (the HTTP API) and a
+   `~/.local/bin/gemma-server` launcher.
 
-This installs Java 21, kscript (via sdkman), creates `~/models/`, and makes the script executable.
+### Configuration (environment variables)
 
-### 2. Download the model
+Pass these before the install command, e.g. `REBUILD=1 bash install.sh`:
 
-Download from [HuggingFace](https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm):
-
-```bash
-# Install the HuggingFace CLI
-pip install huggingface_hub
-
-# Download the model (~2.58 GB)
-huggingface-cli download litert-community/gemma-4-E2B-it-litert-lm \
-    --include '*.litertlm' --local-dir ~/models
-```
-
-Or copy from your computer:
-
-```bash
-# On your computer
-adb push gemma-4-E2B-it.litertlm /sdcard/models/
-
-# In Termux
-cp /sdcard/models/gemma-4-E2B-it.litertlm ~/models/
-```
-
-### 3. Start the server
-
-```bash
-./gemma-server.kts
-# or
-./gemma-server.kts ~/models/gemma-4-E2B-it.litertlm
-```
-
-**First run** will take a few minutes while kscript downloads dependencies (~200 MB).
-Subsequent runs start in seconds thanks to kscript's cache.
-
-### 4. Test
-
-Open a second Termux session:
-
-```bash
-curl http://localhost:8080/health
-```
+| Variable | Default | Description |
+|---|---|---|
+| `LITERTLM_REF` | `main` | LiteRT-LM git ref to build |
+| `BUILD_JOBS` | `auto` | Override parallel build jobs |
+| `REBUILD` | `0` | `1` forces a clean rebuild of the binary |
+| `SKIP_MODEL` | `0` | `1` skips the model download |
+| `GEMMA_MODEL_URL` | HuggingFace URL | Source URL for the model |
+| `GEMMA_MODEL_FILE` | `~/models/gemma-4-E2B-it.litertlm` | Where to store the model |
+| `GEMMA_HOME` | `~/.gemma-server` | Install location for binary + server |
 
 ---
 
-## API Reference
+## Running the server
+
+```bash
+gemma-server
+# or directly:
+python3 ~/.gemma-server/gemma_server.py
+```
+
+### Server configuration (environment variables)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMMA_HOST` | `127.0.0.1` | Bind address. Set `0.0.0.0` to expose on the LAN |
+| `GEMMA_PORT` | `8080` | Listen port |
+| `GEMMA_BACKEND` | `cpu` | `cpu` or `gpu` (GPU may fall back to CPU) |
+| `GEMMA_MODEL_FILE` | `~/models/gemma-4-E2B-it.litertlm` | Model path |
+| `GEMMA_MODEL_ID` | `gemma-4-E2B` | Model id reported by the API |
+| `GEMMA_TIMEOUT` | `600` | Per-request inference timeout (seconds) |
+
+> 🔒 The server binds to **localhost by default**. Only set `GEMMA_HOST=0.0.0.0`
+> on a trusted network — the API is unauthenticated.
+
+---
+
+## ⚠️ Important: how this "server" works
+
+`litert_lm_main` is a **one-shot CLI** — it has no built-in server or session
+mode. The HTTP layer is therefore a **compatibility wrapper**: for each request
+it invokes the binary, which **reloads the whole model every time**.
+
+Consequences:
+
+- **Latency:** every request pays the full model-load + prefill cost (seconds to
+  minutes depending on device). There is no warm residency.
+- **Serialized:** only one inference runs at a time. Concurrent requests get
+  `429 Busy` instead of triggering a second multi-GB load (which would OOM).
+- `/health` reports `"mode": "one-shot-wrapper"`, `"persistent_model": false`.
+
+This is the honest trade-off of building on the upstream CLI. A true persistent
+native server would require linking against the LiteRT-LM C++ Engine API
+directly — a possible future enhancement.
+
+---
+
+## API reference
 
 ### `GET /health`
 
-Returns server status.
-
 ```bash
 curl http://localhost:8080/health
 ```
-
 ```json
 {
   "status": "ok",
+  "mode": "one-shot-wrapper",
+  "persistent_model": false,
   "model": "gemma-4-E2B",
-  "backend": "GPU",
-  "model_path": "/data/data/com.termux/files/home/models/gemma-4-E2B-it.litertlm"
+  "backend": "cpu",
+  "model_path": "/data/data/com.termux/files/home/models/gemma-4-E2B-it.litertlm",
+  "binary": "/data/data/com.termux/files/home/.gemma-server/litert_lm_main"
 }
 ```
 
----
-
 ### `GET /v1/models`
-
-Lists available models (OpenAI-compatible).
 
 ```bash
 curl http://localhost:8080/v1/models
 ```
-
 ```json
-{
-  "object": "list",
-  "data": [{ "id": "gemma-4-E2B", "object": "model", "owned_by": "google" }]
-}
+{ "object": "list", "data": [{ "id": "gemma-4-E2B", "object": "model", "owned_by": "google" }] }
 ```
-
----
 
 ### `POST /v1/chat/completions`
 
-Chat completions — OpenAI-compatible.
-
-#### Non-streaming
+OpenAI-compatible. The wrapper flattens `messages` into a single prompt and lets
+LiteRT-LM apply the Gemma chat template.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
@@ -125,7 +180,6 @@ curl http://localhost:8080/v1/chat/completions \
     ]
   }'
 ```
-
 ```json
 {
   "id": "chatcmpl-...",
@@ -140,136 +194,76 @@ curl http://localhost:8080/v1/chat/completions \
 }
 ```
 
-#### Streaming (SSE)
+#### Streaming (`"stream": true`)
 
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemma-4-E2B",
-    "messages": [{"role": "user", "content": "Tell me a short story."}],
-    "stream": true
-  }'
-```
+Supported for client compatibility, but **non-incremental** — because the binary
+produces the full answer at once, the complete text arrives in a single SSE
+chunk followed by `data: [DONE]`.
 
-Each streamed chunk:
-```
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"gemma-4-E2B","choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":null}]}
-
-data: [DONE]
-```
-
-#### Optional parameters
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `temperature` | float | 1.0 | Sampling temperature (0–2) |
-| `top_p` | float | 0.95 | Nucleus sampling |
-| `top_k` | int | 40 | Top-K sampling |
-| `max_tokens` | int | — | Max output tokens (informational) |
-| `stream` | bool | false | Enable SSE streaming |
+| Status | Meaning |
+|---|---|
+| `400` | Bad JSON / empty `messages` / prompt too long |
+| `429` | Busy — another inference is already running |
+| `503` | Engine error (binary/model missing, non-zero exit, timeout) |
 
 ---
 
-## Configuration
-
-| Environment variable | Default | Description |
-|---|---|---|
-| `LITERT_MODEL_PATH` | `~/models/gemma-4-E2B-it.litertlm` | Path to `.litertlm` model file |
-| `LITERT_CACHE_DIR` | `~/.cache/litert-lm` | Directory for LiteRT compiled artifacts |
-
----
-
-## Using with OpenAI-compatible clients
-
-### Open WebUI / Ollama proxy
-
-Point the client at `http://<android-ip>:8080/v1`.
-
-### Continue (VS Code/JetBrains)
-
-```json
-{
-  "models": [{
-    "title": "Gemma4-E2B (local)",
-    "provider": "openai",
-    "model": "gemma-4-E2B",
-    "apiBase": "http://localhost:8080/v1",
-    "apiKey": "none"
-  }]
-}
-```
-
-### Python `openai` library
+## Using with OpenAI clients
 
 ```python
 from openai import OpenAI
-
 client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
-response = client.chat.completions.create(
+print(client.chat.completions.create(
     model="gemma-4-E2B",
     messages=[{"role": "user", "content": "Hello!"}],
-)
-print(response.choices[0].message.content)
+).choices[0].message.content)
 ```
+
+For **Continue** / **Open WebUI** point the client's `apiBase` at
+`http://<android-ip>:8080/v1` (set `GEMMA_HOST=0.0.0.0` first).
 
 ---
 
-## GPU Acceleration Notes
+## GPU acceleration
 
-### On Termux (direct, without proot-distro)
-
-> ⚠️ **Compatibility caveat:** `litertlm-jvm` ships native libraries compiled for
-> **Linux + glibc** (ARM64). Termux runs on Android's **Bionic** libc, which is not
-> fully glibc-compatible. The native library may fail to load, and the engine will
-> **fall back to CPU automatically**.
-
-The server will print one of:
-```
-[INFO] GPU backend initialised successfully.
-[WARN] GPU backend unavailable (...) — falling back to CPU.
-```
-
-### Recommended: proot-distro (full Linux/glibc environment)
-
-For reliable GPU acceleration, run inside a Linux distribution via `proot-distro`:
+The CMake build links against Termux-native libraries, so unlike the old
+glibc JVM build the GPU path can work if your device exposes an OpenCL driver
+(typically `/vendor/lib64/libOpenCL.so`). Try:
 
 ```bash
-# Install proot-distro
-pkg install proot-distro
-
-# Install Ubuntu
-proot-distro install ubuntu
-
-# Log into Ubuntu
-proot-distro login ubuntu
-
-# Inside Ubuntu: install Java and kscript, then run the server
-apt update && apt install -y openjdk-21-jdk curl unzip
-# ... follow setup-termux.sh steps for kscript installation
-./gemma-server.kts
+GEMMA_BACKEND=gpu gemma-server
 ```
 
-Inside proot-distro, the glibc environment is native and GPU via OpenCL should work
-if your device's OpenCL driver is accessible (typically at `/vendor/lib64/libOpenCL.so`).
+If the GPU backend is unavailable, `litert_lm_main` falls back to CPU.
 
 ---
 
-## Running as `.main.kts` (without kscript)
+## Manual build (without the installer)
 
-If you prefer using the plain `kotlin` command:
+```bash
+pkg install clang cmake make ninja git rust python openjdk-17 zlib openssl libcurl
+git clone https://github.com/google-ai-edge/LiteRT-LM
+cd LiteRT-LM
+cmake -B cmake/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20
+cmake --build cmake/build -t litert_lm_main -j2   # keep -j low to avoid OOM
+./cmake/build/litert_lm_main \
+  --model_path=~/models/gemma-4-E2B-it.litertlm \
+  --backend=cpu \
+  --input_prompt="What is the tallest building in the world?"
+```
 
-1. Copy `gemma-server.kts` to `gemma-server.main.kts`
-2. Replace the `@file:MavenRepository(...)` lines with:
-   ```kotlin
-   @file:Repository("https://dl.google.com/android/maven2")
-   ```
-3. Run with:
-   ```bash
-   kotlin gemma-server.main.kts
-   ```
+---
 
-The `kotlin` command ships with `kotlinc` (`pkg install kotlin` in Termux).
+## Adding swap
+
+The compile is memory-hungry. If you have < 5.5 GB RAM, add swap first:
+
+```bash
+mkdir -p ~/swap
+dd if=/dev/zero of=~/swap/file bs=1M count=6144
+mkswap ~/swap/file
+sudo swapon ~/swap/file
+```
 
 ---
 
@@ -277,9 +271,18 @@ The `kotlin` command ships with `kotlinc` (`pkg install kotlin` in Termux).
 
 | Symptom | Fix |
 |---|---|
-| `Model file not found` | Check `LITERT_MODEL_PATH` or pass path as argument |
-| `Failed to initialise engine on CPU` | Try inside proot-distro (Ubuntu) |
-| `Address already in use` | `pkill -f kscript` or change `PORT` in the script |
-| Port not reachable from other devices | Allow traffic: `termux-wake-lock` is not required; check Android Wi-Fi AP |
-| Very slow first inference | Normal on CPU — GPU decode is 52 tok/s vs CPU 47 tok/s on S26 Ultra |
-| kscript hangs on first run | Downloading ~200 MB of Maven dependencies — wait or check network |
+| Build killed (`Signal 9` / SEGFAULT) | Out of memory — add swap and/or lower `BUILD_JOBS=1`, then re-run |
+| Build fails midway | Re-run the installer; completed steps are skipped |
+| `Model not found` | Re-run to resume the download, or set `GEMMA_MODEL_FILE` |
+| `429 Busy` | Expected — one inference at a time; retry shortly |
+| Very slow responses | Expected — the model reloads every request (see note above) |
+| `gemma-server: command not found` | `source ~/.bashrc` or open a new Termux session |
+| GPU not used | `GEMMA_BACKEND=gpu`; falls back to CPU if no OpenCL driver |
+
+---
+
+## License
+
+This project wraps [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM)
+(Apache 2.0). The Gemma model is subject to Google's
+[Gemma terms of use](https://ai.google.dev/gemma/terms).
