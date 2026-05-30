@@ -109,19 +109,33 @@ else
 fi
 
 # ── 3. Build the native binary ───────────────────────────────────────────────
-step "Building litert_lm_main (this can take several hours on-device)"
-if [ -x "$BUILD_DIR/litert_lm_main" ] && [ "$REBUILD" != "1" ]; then
+# The top-level CMake project is an *orchestrator*: it wraps the real build in an
+# ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
+# target (building `-t litert_lm_main` fails with "No rule to make target"), so we
+# build the default target and then locate the binary inside the sub-build tree.
+step "Building litert_lm (orchestrator → litert_lm_main; can take several hours)"
+
+find_built_binary() {
+    find "$BUILD_DIR" -type f -name litert_lm_main 2>/dev/null | head -n1
+}
+
+EXISTING_BIN="$(find_built_binary || true)"
+if [ -n "$EXISTING_BIN" ] && [ "$REBUILD" != "1" ]; then
     info "Binary already built — skipping (set REBUILD=1 to force a rebuild)."
 else
     cmake -B "$BUILD_DIR" -S "$SRC_DIR" -G "Unix Makefiles" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CXX_STANDARD=20
+        -DCMAKE_BUILD_TYPE=Release
     info "Compiling with -j${BUILD_JOBS} — grab a coffee (or two)…"
-    cmake --build "$BUILD_DIR" -t litert_lm_main -j"${BUILD_JOBS}"
+    # No -t: build the default `all` target, which drives the `litert_lm`
+    # ExternalProject. The make jobserver propagates -j to the inner build.
+    cmake --build "$BUILD_DIR" -j"${BUILD_JOBS}"
 fi
-[ -x "$BUILD_DIR/litert_lm_main" ] || error "Build finished but $BUILD_DIR/litert_lm_main is missing."
-cp -f "$BUILD_DIR/litert_lm_main" "$SERVER_BIN"
+
+BUILT_BIN="$(find_built_binary || true)"
+[ -n "$BUILT_BIN" ] || error "Build finished but no 'litert_lm_main' was produced under $BUILD_DIR."
+cp -f "$BUILT_BIN" "$SERVER_BIN"
 chmod +x "$SERVER_BIN"
+info "Native binary built at: $BUILT_BIN"
 info "Native binary installed: $SERVER_BIN"
 
 # ── 4. Download the model ────────────────────────────────────────────────────

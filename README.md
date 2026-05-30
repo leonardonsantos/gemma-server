@@ -65,12 +65,14 @@ The installer `pkg install`s the rest automatically:
    `-j` value (`(RAM+swap)/8`, capped at CPU count) to avoid OOM-kills.
 2. **Toolchain** — `pkg install` of the build dependencies above.
 3. **Source** — clones `google-ai-edge/LiteRT-LM` into `~/.gemma-server/LiteRT-LM`.
-4. **Build** — the CMake Super-Build:
+4. **Build** — the CMake Super-Build (an orchestrator that wraps the real build
+   in an `ExternalProject`):
    ```bash
-   cmake -B cmake/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20
-   cmake --build cmake/build -t litert_lm_main -j<N>
+   cmake -B cmake/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+   cmake --build cmake/build -j<N>          # builds the litert_lm ExternalProject
    ```
-   The binary is copied to `~/.gemma-server/litert_lm_main`.
+   The resulting `litert_lm_main` is found under `cmake/build/` and copied to
+   `~/.gemma-server/litert_lm_main`.
 5. **Model** — downloads `gemma-4-E2B-it.litertlm` (~2.6 GB, **resumable**) from
    HuggingFace to `~/models/`.
 6. **Server** — writes `~/.gemma-server/gemma_server.py` (the HTTP API) and a
@@ -244,9 +246,11 @@ If the GPU backend is unavailable, `litert_lm_main` falls back to CPU.
 pkg install clang cmake make ninja git rust python openjdk-17 zlib openssl libcurl
 git clone https://github.com/google-ai-edge/LiteRT-LM
 cd LiteRT-LM
-cmake -B cmake/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20
-cmake --build cmake/build -t litert_lm_main -j2   # keep -j low to avoid OOM
-./cmake/build/litert_lm_main \
+cmake -B cmake/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake/build -j2            # default target; keep -j low to avoid OOM
+# The binary is produced inside the ExternalProject sub-build:
+BIN=$(find cmake/build -type f -name litert_lm_main | head -n1)
+"$BIN" \
   --model_path=~/models/gemma-4-E2B-it.litertlm \
   --backend=cpu \
   --input_prompt="What is the tallest building in the world?"
