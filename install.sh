@@ -147,19 +147,38 @@ else
     # return NOTFOUND and CMake's generate step aborts. Since host == target
     # on-device, the system libs are ABI compatible: expose linkable symlinks in
     # $PREFIX/lib so `-llog`, `-lEGL`, `-lGLESv2`, `-lGLESv3` resolve.
+    #
+    # Note: Android has no standalone `libGLESv3.so` — GLES v3 entry points live
+    # in the `libGLESv2.so` loader — so `find_library(GLESv3)` would still fail.
+    # We therefore map each linker name to an ordered list of system-lib
+    # candidates and symlink the first that exists (GLESv3 falls back to GLESv2).
+    link_system_lib() {
+        # $1 = linker name to expose (e.g. libGLESv3); $2.. = source basenames
+        local want="$1"; shift
+        [ -e "$PREFIX/lib/$want.so" ] && return 0
+        local cand
+        for cand in "$@"; do
+            for dir in "$sys_libdir" /system/lib64 /system/lib /vendor/lib64 /vendor/lib; do
+                if [ -e "$dir/$cand.so" ]; then
+                    ln -sf "$dir/$cand.so" "$PREFIX/lib/$want.so" \
+                        && info "Linked $want -> $dir/$cand.so into \$PREFIX/lib."
+                    return 0
+                fi
+            done
+        done
+        return 1
+    }
     if [ -n "${PREFIX:-}" ]; then
         case "$(uname -m)" in
             aarch64|arm64|x86_64) sys_libdir="/system/lib64" ;;
             *)                    sys_libdir="/system/lib"   ;;
         esac
-        for _lib in liblog libEGL libGLESv2 libGLESv3 libGLESv1_CM; do
-            if [ ! -e "$PREFIX/lib/$_lib.so" ] && [ -e "$sys_libdir/$_lib.so" ]; then
-                ln -sf "$sys_libdir/$_lib.so" "$PREFIX/lib/$_lib.so" \
-                    && info "Linked Android $_lib ($sys_libdir/$_lib.so) into \$PREFIX/lib."
-            fi
-        done
-        [ -e "$PREFIX/lib/liblog.so" ] \
-            || warn "Could not locate $sys_libdir/liblog.so; TFLite/LiteRT link may fail."
+        link_system_lib liblog       liblog                || warn "liblog not found; TFLite/LiteRT link may fail."
+        link_system_lib libEGL       libEGL                || warn "libEGL not found; LiteRT GPU link may fail."
+        link_system_lib libGLESv2    libGLESv2             || warn "libGLESv2 not found; LiteRT GPU link may fail."
+        # No standalone libGLESv3.so on Android -> fall back to the v2 loader.
+        link_system_lib libGLESv3    libGLESv3 libGLESv2   || warn "libGLESv3 not found; LiteRT GPU link may fail."
+        link_system_lib libGLESv1_CM libGLESv1_CM          || true
     fi
 
     cmake -B "$BUILD_DIR" -S "$SRC_DIR" -G "Unix Makefiles" \
