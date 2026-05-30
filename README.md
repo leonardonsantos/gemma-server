@@ -46,7 +46,7 @@ curl http://localhost:8080/health
 
 | Requirement | Notes |
 |---|---|
-| Android device | ARM64 (`aarch64`), ≥ 8 GB RAM recommended |
+| Android device | ARM64 (`aarch64`), **Android 11+ (API 30)**, ≥ 8 GB RAM recommended |
 | [Termux](https://github.com/termux/termux-app) | Install from **F-Droid** (not Play Store) |
 | Storage | ~8 GB free (model ≈ 2.6 GB + build tree) |
 | RAM + swap | ≥ 5.5 GB combined for the compile ([add swap](#adding-swap) if needed) |
@@ -86,6 +86,7 @@ Pass these before the install command, e.g. `REBUILD=1 bash install.sh`:
 |---|---|---|
 | `LITERTLM_REF` | `main` | LiteRT-LM git ref to build |
 | `BUILD_JOBS` | `auto` | Override parallel build jobs |
+| `GEMMA_ANDROID_API` | `30` | Android API level the native build targets (≥ 30 required) |
 | `REBUILD` | `0` | `1` forces a clean rebuild of the binary |
 | `SKIP_MODEL` | `0` | `1` skips the model download |
 | `GEMMA_MODEL_URL` | HuggingFace URL | Source URL for the model |
@@ -247,6 +248,9 @@ pkg install clang cmake make ninja git rust python openjdk-17 zlib openssl libcu
 git clone https://github.com/google-ai-edge/LiteRT-LM
 cd LiteRT-LM
 cmake -B cmake/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+# Pin the Rust/cc-rs target to API 30 so cxx compiles (pthread_cond_clockwait):
+export CFLAGS_aarch64_linux_android="--target=aarch64-linux-android30"
+export CXXFLAGS_aarch64_linux_android="--target=aarch64-linux-android30"
 cmake --build cmake/build -j2            # default target; keep -j low to avoid OOM
 # The binary is produced inside the ExternalProject sub-build:
 BIN=$(find cmake/build -type f -name litert_lm_main | head -n1)
@@ -276,6 +280,7 @@ sudo swapon ~/swap/file
 | Symptom | Fix |
 |---|---|
 | Build killed (`Signal 9` / SEGFAULT) | Out of memory — add swap and/or lower `BUILD_JOBS=1`, then re-run |
+| `use of undeclared identifier 'pthread_cond_clockwait'` | A Rust crate (`cxx`) needs Android API 30 symbols. The installer pins the target to API 30; ensure your device is **Android 11+**, or set `GEMMA_ANDROID_API` to your device's level (≥ 30) |
 | Build fails midway | Re-run the installer; completed steps are skipped |
 | `Model not found` | Re-run to resume the download, or set `GEMMA_MODEL_FILE` |
 | `429 Busy` | Expected — one inference at a time; retry shortly |

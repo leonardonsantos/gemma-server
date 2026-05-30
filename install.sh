@@ -30,6 +30,7 @@ LITERTLM_REF="${LITERTLM_REF:-main}"
 REBUILD="${REBUILD:-0}"
 SKIP_MODEL="${SKIP_MODEL:-0}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
+GEMMA_ANDROID_API="${GEMMA_ANDROID_API:-30}"
 SERVER_BIN="$GEMMA_HOME/litert_lm_main"
 BIN_DIR="$PREFIX_HOME/.local/bin"
 
@@ -125,6 +126,20 @@ if [ -n "$EXISTING_BIN" ] && [ "$REBUILD" != "1" ]; then
 else
     cmake -B "$BUILD_DIR" -S "$SRC_DIR" -G "Unix Makefiles" \
         -DCMAKE_BUILD_TYPE=Release
+
+    # The build compiles Rust crates (cxx, llguidance) via cc-rs. cc-rs invokes
+    # clang with `--target=aarch64-linux-android` (no API suffix), which resolves
+    # to a default API level below 30. Bionic's libc++ <condition_variable>
+    # header then references `pthread_cond_clockwait` (introduced in API 30),
+    # failing with "use of undeclared identifier". Pin the API level so the
+    # symbol is visible. cc-rs appends these target-specific flags after its own
+    # `--target`, and clang's last `--target` wins. Requires Android >= API 30.
+    local_target="aarch64-linux-android${GEMMA_ANDROID_API}"
+    export CFLAGS_aarch64_linux_android="--target=${local_target} ${CFLAGS_aarch64_linux_android:-}"
+    export CXXFLAGS_aarch64_linux_android="--target=${local_target} ${CXXFLAGS_aarch64_linux_android:-}"
+    export BINDGEN_EXTRA_CLANG_ARGS="--target=${local_target} ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+    info "Pinned Rust/cc-rs target to ${local_target} (override with GEMMA_ANDROID_API)."
+
     info "Compiling with -j${BUILD_JOBS} — grab a coffee (or two)…"
     # No -t: build the default `all` target, which drives the `litert_lm`
     # ExternalProject. The make jobserver propagates -j to the inner build.
