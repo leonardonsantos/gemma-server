@@ -136,24 +136,30 @@ else
     host_protoc_bin="$inner/external/protobuf/install/bin"
     host_flatc_bin="$inner/external/flatbuffers/install/bin"
 
-    # --- Android liblog visibility ----------------------------------------------
-    # TFLite's `benchmark_model` target does `find_library(ANDROID_LOG_LIB log)`.
-    # Android's liblog lives in the read-only system image (/system/lib{,64}) and
-    # is NOT shipped as a linkable `liblog.so` in Termux's $PREFIX/lib, so the
-    # find fails with "set to NOTFOUND" and CMake's generate step aborts. Expose a
-    # linkable symlink in $PREFIX/lib (host == target, so the system lib is ABI
-    # compatible) so `-llog` resolves.
-    if [ -n "${PREFIX:-}" ] && [ ! -e "$PREFIX/lib/liblog.so" ]; then
+    # --- Android system libraries (liblog / EGL / GLES) -------------------------
+    # Several upstream targets resolve system libraries via find_library():
+    #   * TFLite's `benchmark_model`            -> ANDROID_LOG_LIB  (log)
+    #   * LiteRT runtime / C-API shared lib     -> ANDROID_EGL_LIB  (EGL),
+    #                                              ANDROID_GLESV2_LIB (GLESv2),
+    #                                              ANDROID_GLESV3_LIB (GLESv3)
+    # These ship only in Android's read-only system image (/system/lib{,64}) and
+    # are NOT present as linkable .so files in Termux's $PREFIX/lib, so the finds
+    # return NOTFOUND and CMake's generate step aborts. Since host == target
+    # on-device, the system libs are ABI compatible: expose linkable symlinks in
+    # $PREFIX/lib so `-llog`, `-lEGL`, `-lGLESv2`, `-lGLESv3` resolve.
+    if [ -n "${PREFIX:-}" ]; then
         case "$(uname -m)" in
             aarch64|arm64|x86_64) sys_libdir="/system/lib64" ;;
             *)                    sys_libdir="/system/lib"   ;;
         esac
-        if [ -e "$sys_libdir/liblog.so" ]; then
-            ln -sf "$sys_libdir/liblog.so" "$PREFIX/lib/liblog.so" \
-                && info "Linked Android liblog ($sys_libdir/liblog.so) into \$PREFIX/lib for TFLite."
-        else
-            warn "Could not locate $sys_libdir/liblog.so; TFLite link of ANDROID_LOG_LIB may fail."
-        fi
+        for _lib in liblog libEGL libGLESv2 libGLESv3 libGLESv1_CM; do
+            if [ ! -e "$PREFIX/lib/$_lib.so" ] && [ -e "$sys_libdir/$_lib.so" ]; then
+                ln -sf "$sys_libdir/$_lib.so" "$PREFIX/lib/$_lib.so" \
+                    && info "Linked Android $_lib ($sys_libdir/$_lib.so) into \$PREFIX/lib."
+            fi
+        done
+        [ -e "$PREFIX/lib/liblog.so" ] \
+            || warn "Could not locate $sys_libdir/liblog.so; TFLite/LiteRT link may fail."
     fi
 
     cmake -B "$BUILD_DIR" -S "$SRC_DIR" -G "Unix Makefiles" \
