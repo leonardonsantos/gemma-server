@@ -112,6 +112,26 @@ else
         || git clone --depth 1 "$LITERTLM_REPO" "$SRC_DIR"
 fi
 
+# --- Native KleidiAI link fix ------------------------------------------------
+# On aarch64, XNNPACK is built with KleidiAI and references its kai_* microkernels
+# (xnnpack/src/reference/packing.cc). But LiteRT-LM only adds libkleidiai.a to the
+# TFLite link map when cross-compiling:
+#     if(LITERTLM_TOOLCHAIN_ARGS)
+#         list(APPEND TFLITE_TARGET_MAP "kleidiai=${TFLITE_LIB_DIR}/libkleidiai.a")
+#     endif()
+# A native Termux build leaves LITERTLM_TOOLCHAIN_ARGS empty, so the archive is
+# never linked and the run_model/litert_lm_main link fails with hundreds of
+# "undefined symbol: kai_*". Broaden the guard to also fire on native aarch64.
+# (Re-applied every run because the clone step does `git reset --hard`.)
+TARGET_MAP="$SRC_DIR/cmake/packages/tflite/tflite_target_map.cmake"
+if [ -f "$TARGET_MAP" ] && ! grep -q 'CMAKE_SYSTEM_PROCESSOR MATCHES.*aarch64' "$TARGET_MAP"; then
+    sed -i.bak \
+        's/if(LITERTLM_TOOLCHAIN_ARGS)/if(LITERTLM_TOOLCHAIN_ARGS OR CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|armv8)")/' \
+        "$TARGET_MAP" \
+        && rm -f "$TARGET_MAP.bak" \
+        && info "Patched TFLite target map to link libkleidiai.a on native aarch64."
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
