@@ -33,6 +33,14 @@ BUILD_JOBS="${BUILD_JOBS:-auto}"
 GEMMA_ANDROID_API="${GEMMA_ANDROID_API:-30}"
 SERVER_BIN="$GEMMA_HOME/litert_lm_main"
 BIN_DIR="$PREFIX_HOME/.local/bin"
+# Runtime dir for prebuilt shared libs the binary dlopen/links against
+# (e.g. libGemmaModelConstraintProvider.so). Added to LD_LIBRARY_PATH by the launcher.
+LIB_DIR="$GEMMA_HOME/lib"
+# Prebuilt (closed-source) Gemma constraint provider .so, shipped via git-LFS in the
+# LiteRT-LM tree. The CMake build links it; the Gemma data processors call its C API.
+GEMMA_PREBUILT_SO="libGemmaModelConstraintProvider.so"
+GEMMA_PREBUILT_REL="prebuilt/android_arm64/$GEMMA_PREBUILT_SO"
+GEMMA_PREBUILT_URL="${GEMMA_PREBUILT_URL:-$LITERTLM_REPO/raw/$LITERTLM_REF/$GEMMA_PREBUILT_REL}"
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -245,6 +253,84 @@ open(p, 'w').write(head + s + tail)
 PY
 fi
 
+# --- Stale CMake source references (Bazel refactor drift) ---------------------
+# LiteRT-LM's CMake files lag a Bazel refactor: several runtime/*/CMakeLists.txt
+# list .cc sources that were renamed or removed, so the build fails late with
+# "No rule to make target '…/<file>.cc'". A scan of every runtime CMakeLists for
+# referenced-but-absent .cc files found these, all confirmed against the Bazel
+# BUILD files:
+#   * session_basic.cc      -> renamed session_advanced.cc (SessionBasic→SessionAdvanced)
+#   * engine_impl.cc (x2)   -> renamed engine_advanced_impl.cc (engine_impl is now a Bazel alias)
+#   * session_factory.cc    -> removed entirely (SessionFactory concept dropped)
+#   * gemma_model_constraint_provider.cc -> never a source; it is a prebuilt .so
+# Realign runtime/core/CMakeLists.txt to the renamed sources, and turn the now
+# source-less session_factory target into an INTERFACE forwarder to session_basic
+# (which builds session_advanced.cc) so its existing dependents still resolve.
+CORE_CML="$SRC_DIR/runtime/core/CMakeLists.txt"
+if [ -f "$CORE_CML" ] && ! grep -q 'gemma-server: core targets realigned' "$CORE_CML"; then
+    python3 - "$CORE_CML" <<'PY' && info "Realigned runtime/core CMake targets to renamed sources."
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace('session_basic.cc', 'session_advanced.cc')
+s = s.replace('engine_impl.cc', 'engine_advanced_impl.cc')
+# Replace the source-less STATIC session_factory target with an INTERFACE forwarder.
+s = re.sub(
+    r'add_litertlm_library\(runtime_core_session_factory STATIC.*?LITERTLM_DEPS\s*\n\)',
+    'add_library(runtime_core_session_factory INTERFACE)\n'
+    'add_library(LiteRTLM::Runtime::Core::SessionFactory ALIAS runtime_core_session_factory)\n'
+    'target_link_libraries(runtime_core_session_factory INTERFACE\n'
+    '  runtime_core_session_basic\n'
+    ')',
+    s, flags=re.S)
+s += '\n# gemma-server: core targets realigned to renamed sources\n'
+open(p, 'w').write(s)
+PY
+fi
+
+# The Gemma constraint provider is a prebuilt, closed-source shared library (the
+# tree carries only its header); the stale CMake tries to compile a non-existent
+# gemma_model_constraint_provider.cc. The Gemma data processors call its C API,
+# and litert_lm_main links them, so import the prebuilt .so instead of compiling.
+CD_CML="$SRC_DIR/runtime/components/constrained_decoding/CMakeLists.txt"
+if [ -f "$CD_CML" ] && ! grep -q 'gemma-server: import prebuilt provider' "$CD_CML"; then
+    python3 - "$CD_CML" <<'PY' && info "Switched Gemma constraint provider to the prebuilt .so."
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+repl = (
+'# gemma-server: import prebuilt provider (no source .cc upstream)\n'
+'add_library(runtime_components_constrained_decoding_gemma_model_constraint_provider SHARED IMPORTED GLOBAL)\n'
+'set_target_properties(runtime_components_constrained_decoding_gemma_model_constraint_provider PROPERTIES\n'
+'  IMPORTED_LOCATION "${LITERTLM_PROJECT_ROOT}/prebuilt/android_arm64/libGemmaModelConstraintProvider.so"\n'
+'  INTERFACE_INCLUDE_DIRECTORIES "${LITERTLM_INCLUDE_PATHS};${LITERT_INCLUDE_PATHS}"\n'
+'  INTERFACE_LINK_LIBRARIES "LiteRTLM::Runtime::Components::ConstrainedDecoding::Constraint;LiteRTLM::Runtime::Util::ConvertTensorBuffer;LiteRTLM::Runtime::Util::LiteRtStatusUtil"\n'
+')\n'
+'add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding::GemmaModelConstraintProvider ALIAS runtime_components_constrained_decoding_gemma_model_constraint_provider)'
+)
+s = re.sub(
+    r'add_litertlm_library\(runtime_components_constrained_decoding_gemma_model_constraint_provider STATIC.*?LITERTLM_DEPS\s*\n\)',
+    repl, s, flags=re.S)
+open(p, 'w').write(s)
+PY
+fi
+
+# Materialize the prebuilt provider .so: a plain clone leaves it as a ~133-byte
+# git-LFS pointer, but the final link needs the real ~19 MB ELF. Fetch it from
+# the GitHub media endpoint (the raw URL 302-redirects to the LFS object).
+_gso="$SRC_DIR/$GEMMA_PREBUILT_REL"
+if [ -f "$_gso" ] && head -c 64 "$_gso" 2>/dev/null | grep -q 'git-lfs.github.com'; then
+    info "Fetching prebuilt $GEMMA_PREBUILT_SO (git-LFS object)…"
+    if curl -fL "$GEMMA_PREBUILT_URL" -o "$_gso.tmp" \
+        && [ "$(stat -c%s "$_gso.tmp" 2>/dev/null || echo 0)" -gt 100000 ]; then
+        mv -f "$_gso.tmp" "$_gso"
+        info "Prebuilt $GEMMA_PREBUILT_SO ready ($(du -h "$_gso" | cut -f1))."
+    else
+        rm -f "$_gso.tmp"
+        warn "Could not fetch a real $GEMMA_PREBUILT_SO — the final link may fail."
+    fi
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
@@ -382,6 +468,14 @@ chmod +x "$SERVER_BIN"
 info "Native binary built at: $BUILT_BIN"
 info "Native binary installed: $SERVER_BIN"
 
+# Install the prebuilt provider .so beside the binary so it loads at runtime
+# (the binary links it; without it on the loader path the server won't start).
+mkdir -p "$LIB_DIR"
+if [ -f "$SRC_DIR/$GEMMA_PREBUILT_REL" ]; then
+    cp -f "$SRC_DIR/$GEMMA_PREBUILT_REL" "$LIB_DIR/" \
+        && info "Runtime lib installed: $LIB_DIR/$GEMMA_PREBUILT_SO"
+fi
+
 # ── 4. Download the model ────────────────────────────────────────────────────
 step "Downloading the Gemma model"
 if [ "$SKIP_MODEL" = "1" ]; then
@@ -417,6 +511,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 GEMMA_HOME = os.path.dirname(os.path.abspath(__file__))
 BINARY = os.environ.get("GEMMA_BINARY", os.path.join(GEMMA_HOME, "litert_lm_main"))
+# Where prebuilt shared libs the binary links (e.g. libGemmaModelConstraintProvider.so)
+# were installed. Prepended to LD_LIBRARY_PATH so inference can dlopen them.
+LIB_DIR = os.environ.get("GEMMA_LIB_DIR", os.path.join(GEMMA_HOME, "lib"))
 MODEL_PATH = os.environ.get(
     "GEMMA_MODEL_FILE",
     os.path.join(os.path.expanduser("~"), "models", "gemma-4-E2B-it.litertlm"),
@@ -500,6 +597,10 @@ def run_inference(prompt):
         prompt_file = fh.name
     try:
         with _infer_lock:
+            child_env = dict(os.environ)
+            child_env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                p for p in (LIB_DIR, child_env.get("LD_LIBRARY_PATH", "")) if p
+            )
             proc = subprocess.run(
                 [
                     BINARY,
@@ -511,6 +612,7 @@ def run_inference(prompt):
                 capture_output=True,
                 text=True,
                 timeout=TIMEOUT,
+                env=child_env,
             )
     except subprocess.TimeoutExpired:
         return None, f"Inference timed out after {TIMEOUT}s."
@@ -652,6 +754,8 @@ cat > "$BIN_DIR/gemma-server" <<EOF
 # Launcher for gemma-server. Env vars (GEMMA_BACKEND, GEMMA_HOST, GEMMA_PORT, …) override defaults.
 export GEMMA_BINARY="\${GEMMA_BINARY:-$SERVER_BIN}"
 export GEMMA_MODEL_FILE="\${GEMMA_MODEL_FILE:-$MODEL_FILE}"
+export GEMMA_LIB_DIR="\${GEMMA_LIB_DIR:-$LIB_DIR}"
+export LD_LIBRARY_PATH="$LIB_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 exec python3 "$GEMMA_HOME/gemma_server.py" "\$@"
 EOF
 chmod +x "$BIN_DIR/gemma-server"
