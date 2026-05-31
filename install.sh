@@ -168,6 +168,33 @@ if [ -f "$FB_CML" ] && ! grep -q 'gemma-server] Recompiling' "$FB_CML"; then
         && info "Patched flatbuffers fallback target to recompile schemas on resume."
 fi
 
+# --- LiteRT API drift fix ----------------------------------------------------
+# LiteRT-LM `main` has drifted ahead of the LiteRT commit it pins
+# (cmake/packages/litert/litert.cmake, fb16353…, 2026-03-24): it calls two
+# option setters that don't exist in that LiteRT yet, so compilation fails at
+# ~88% in runtime/executor/llm_executor_settings_utils.cc:
+#   * litert::GpuOptions::SetKernelBatchSize
+#   * litert::RuntimeOptions::SetDisableDelegateClustering
+# Both are optional tuning hints: SetKernelBatchSize is GPU-only and only fires
+# when an (unset-by-default) hint is present; SetDisableDelegateClustering just
+# forwards a default-valued flag on the CPU path. Drop both calls so the source
+# matches the pinned LiteRT API; default inference is unaffected. (Bumping the
+# LiteRT pin instead would risk the fb16353-specific fixes already in place.)
+LM_EXEC="$SRC_DIR/runtime/executor/llm_executor_settings_utils.cc"
+if [ -f "$LM_EXEC" ]; then
+    python3 - "$LM_EXEC" <<'PY' && info "Patched llm_executor_settings_utils.cc to drop setters absent in pinned LiteRT."
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "gemma-server: setter absent in pinned LiteRT"
+if marker not in s:
+    repl = "; /* %s */" % marker
+    s = re.sub(r'gpu_compilation_options\.SetKernelBatchSize\([^;]*;', repl, s)
+    s = re.sub(r'runtime_options\.SetDisableDelegateClustering\([^;]*;', repl, s)
+    open(p, 'w').write(s)
+PY
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
