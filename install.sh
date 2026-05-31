@@ -170,30 +170,41 @@ fi
 
 # --- LiteRT API drift fix ----------------------------------------------------
 # LiteRT-LM `main` has drifted ahead of the LiteRT commit it pins
-# (cmake/packages/litert/litert.cmake, fb16353…, 2026-03-24): it calls two
-# option setters that don't exist in that LiteRT yet, so compilation fails at
-# ~88% in runtime/executor/llm_executor_settings_utils.cc:
-#   * litert::GpuOptions::SetKernelBatchSize
-#   * litert::RuntimeOptions::SetDisableDelegateClustering
-# Both are optional tuning hints: SetKernelBatchSize is GPU-only and only fires
-# when an (unset-by-default) hint is present; SetDisableDelegateClustering just
-# forwards a default-valued flag on the CPU path. Drop both calls so the source
-# matches the pinned LiteRT API; default inference is unaffected. (Bumping the
-# LiteRT pin instead would risk the fb16353-specific fixes already in place.)
-LM_EXEC="$SRC_DIR/runtime/executor/llm_executor_settings_utils.cc"
-if [ -f "$LM_EXEC" ]; then
-    python3 - "$LM_EXEC" <<'PY' && info "Patched llm_executor_settings_utils.cc to drop setters absent in pinned LiteRT."
+# (cmake/packages/litert/litert.cmake, fb16353…, 2026-03-24): it calls a handful
+# of option setters that don't exist in that LiteRT yet, so compilation fails in
+# runtime/executor/*.cc. A full scan of every GpuOptions/RuntimeOptions/CpuOptions
+# /CompilationOptions call in the tree against the pinned headers found exactly
+# three absent setters:
+#   * litert::GpuOptions::SetKernelBatchSize        (~88%, llm_executor_settings_utils.cc)
+#   * litert::RuntimeOptions::SetDisableDelegateClustering (~88%, same file)
+#   * litert::GpuOptions::SetWeightCacheFd          (~94%, litert_compiled_model_executor_utils.cc)
+# All three are optional tuning hints with no effect on default inference:
+# SetKernelBatchSize is GPU-only and gated on an unset-by-default hint;
+# SetDisableDelegateClustering forwards a default-valued flag on the CPU path;
+# SetWeightCacheFd only feeds a GPU weight-cache fd (we keep the fd local valid
+# via a (void) cast to avoid an unused-variable error). Drop the calls so the
+# source matches the pinned LiteRT API. (Bumping the LiteRT pin instead would risk
+# the fb16353-specific fixes already in place — cc_options stubs, kleidiai, etc.)
+for _f in runtime/executor/llm_executor_settings_utils.cc \
+          runtime/executor/litert_compiled_model_executor_utils.cc; do
+    _path="$SRC_DIR/$_f"
+    [ -f "$_path" ] || continue
+    python3 - "$_path" <<'PY' && info "Patched $(basename "$_path") for setters absent in pinned LiteRT."
 import re, sys
 p = sys.argv[1]
 s = open(p).read()
 marker = "gemma-server: setter absent in pinned LiteRT"
 if marker not in s:
-    repl = "; /* %s */" % marker
-    s = re.sub(r'gpu_compilation_options\.SetKernelBatchSize\([^;]*;', repl, s)
-    s = re.sub(r'runtime_options\.SetDisableDelegateClustering\([^;]*;', repl, s)
+    drop = "; /* %s */" % marker
+    # Pure-side-effect setters whose arguments are member expressions: drop entirely.
+    s = re.sub(r'gpu_compilation_options\.SetKernelBatchSize\([^;]*;', drop, s)
+    s = re.sub(r'runtime_options\.SetDisableDelegateClustering\([^;]*;', drop, s)
+    # SetWeightCacheFd takes a bare local fd: keep the local "used" via (void).
+    s = re.sub(r'gpu_options\.SetWeightCacheFd\(\s*([A-Za-z0-9_]+)\s*\)\s*;',
+               r'(void)\1; /* %s */' % marker, s)
     open(p, 'w').write(s)
 PY
-fi
+done
 
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
