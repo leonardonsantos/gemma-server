@@ -206,6 +206,45 @@ if marker not in s:
 PY
 done
 
+# --- LiteRT NPU / GoogleTensor drift fix (CPU/GPU-only build) -----------------
+# The pin drift also reaches the NPU (Google Tensor) and audio executors, which
+# call LiteRT APIs absent at fb16353 (~95%):
+#   * litert::google_tensor::GoogleTensorOptions::SetPerformanceMode / ::PerformanceMode
+#   * litert::SimpleTensor::HasQuantization / ::PerTensorQuantization
+# These only run on the NPU backend, which Gemma-on-Termux never uses (CPU/GPU
+# only). LiteRT-LM already supports a CPU/GPU-only build via the LITERT_DISABLE_NPU
+# macro: it #if-guards every NPU/GoogleTensor reference in the factory, audio,
+# vision and util sources, so the factory's lone NPU call site (and all the
+# drifted GoogleTensorOptions calls) compile out. Define it for the inner build —
+# far more robust than chasing each individually drifted NPU symbol.
+if [ -f "$LM_CML" ] && ! grep -q 'LITERT_DISABLE_NPU' "$LM_CML"; then
+    # Append the macro to the existing global add_compile_definitions() block so
+    # it applies to the runtime executor targets defined afterwards. (CMake allows
+    # a trailing `#` line-comment inside a command's argument list.)
+    sed -i.bak \
+        's/^\([[:space:]]*\)absl_nonnull=$/\1absl_nonnull=\n\1LITERT_DISABLE_NPU  # [gemma-server] CPU\/GPU-only: drop NPU\/GoogleTensor paths/' \
+        "$LM_CML" \
+        && rm -f "$LM_CML.bak" \
+        && info "Defined LITERT_DISABLE_NPU for the inner build (CPU/GPU-only)."
+fi
+
+# The NPU executor translation unit is itself NOT #if-guarded — it is always
+# compiled into its own static lib — so LITERT_DISABLE_NPU alone still leaves it
+# using the absent SimpleTensor/GoogleTensorOptions APIs. With the macro defined,
+# nothing references its symbols (the factory's only call site is compiled out),
+# so wrap the whole file in the same guard: it then compiles to an empty object.
+_npu="$SRC_DIR/runtime/executor/llm_litert_npu_compiled_model_executor.cc"
+if [ -f "$_npu" ] && ! grep -q 'gemma-server: NPU TU guarded' "$_npu"; then
+    python3 - "$_npu" <<'PY' && info "Guarded NPU executor TU under LITERT_DISABLE_NPU."
+import sys
+p = sys.argv[1]
+s = open(p).read()
+head = "#if !defined(LITERT_DISABLE_NPU)  // gemma-server: NPU TU guarded\n"
+tail = "\n#endif  // !defined(LITERT_DISABLE_NPU)  gemma-server: NPU TU guarded\n"
+open(p, 'w').write(head + s + tail)
+PY
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
