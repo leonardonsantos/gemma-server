@@ -132,6 +132,42 @@ if [ -f "$TARGET_MAP" ] && ! grep -q 'CMAKE_SYSTEM_PROCESSOR MATCHES.*aarch64' "
         && info "Patched TFLite target map to link libkleidiai.a on native aarch64."
 fi
 
+# --- Flatbuffer schema generation ordering fix -------------------------------
+# The schema header `schema/core/litertlm_header_schema_generated.h` is produced
+# by flatc via a `compile_schemas` step on the `flatbuffers_external` target. But
+# every LiteRT-LM library only depends on the `generator_complete` aggregate,
+# which lists protobuf + cxxbridge generation and NOT flatbuffers. With a parallel
+# `-j` build the schema .cc files (schema_core_litertlm_utils/read/print) compile
+# before flatc runs -> "fatal error: '...litertlm_header_schema_generated.h' file
+# not found". A clean (REBUILD=1) build reliably exposes the race. Make
+# generator_complete depend on flatbuffers_external so the gate waits for flatc.
+LM_CML="$SRC_DIR/cmake/packages/litert_lm/CMakeLists.txt"
+if [ -f "$LM_CML" ] && ! grep -q 'gemma-server.*flatbuffers schema gate' "$LM_CML"; then
+    cat >> "$LM_CML" <<'CMAKE_EOF'
+
+# [gemma-server] flatbuffers schema gate: ensure flatc has generated the schema
+# headers before any LiteRT-LM library compiles (fixes parallel-build race on
+# litertlm_header_schema_generated.h).
+if(TARGET generator_complete AND TARGET flatbuffers_external)
+    add_dependencies(generator_complete flatbuffers_external)
+endif()
+CMAKE_EOF
+    info "Patched litert_lm CMakeLists to gate compilation on flatc schema generation."
+fi
+
+# On a *resume* (flatbuffers already installed), upstream replaces the real
+# ExternalProject with a do-nothing `add_custom_target(flatbuffers_external)`, so
+# the schema headers are never (re)generated and the build fails at ~66% again.
+# Make that fallback target actually recompile the schemas with the host flatc.
+FB_CML="$SRC_DIR/cmake/packages/flatbuffers/flatbuffers.cmake"
+if [ -f "$FB_CML" ] && ! grep -q 'gemma-server] Recompiling' "$FB_CML"; then
+    sed -i.bak \
+        's|add_custom_target(flatbuffers_external)|add_custom_target(flatbuffers_external ALL COMMAND ${CMAKE_COMMAND} -D FLATC_BIN=${FLATC_EXECUTABLE} -D SCHEMA_DIR=${GENERATED_SRC_DIR}/schema -P ${LITERTLM_SCRIPTS_DIR}/compile_flatbuffers.cmake COMMENT "[gemma-server] Recompiling Flatbuffer schemas")|' \
+        "$FB_CML" \
+        && rm -f "$FB_CML.bak" \
+        && info "Patched flatbuffers fallback target to recompile schemas on resume."
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
