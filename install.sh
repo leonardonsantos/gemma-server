@@ -331,6 +331,30 @@ if [ -f "$_gso" ] && head -c 64 "$_gso" 2>/dev/null | grep -q 'git-lfs.github.co
     fi
 fi
 
+# --- Stale LiteRT target-map entry (pinned-LiteRT drift) ---------------------
+# The litert aggregate links *every* static-lib path in litert_target_map.cmake
+# directly into litert_lm_main. The map's most recent entry,
+#   "litert::cc_options=${LITERT_BUILD_DIR}/cc/options/liblitert_cc_options.a"
+# expects a standalone archive, but at the pinned LiteRT commit cc/options is an
+# INTERFACE compatibility target whose sources (litert_compiler_options.cc) are
+# compiled straight into liblitert_cc_api.a — so no liblitert_cc_options.a is
+# ever produced and the final link dies with
+#   "No rule to make target '…/cc/options/liblitert_cc_options.a'".
+# Those symbols already live in liblitert_cc_api.a (also in the map), and nothing
+# references litert::cc_options by name, so drop the stale entry.
+LM_TARGET_MAP="$SRC_DIR/cmake/packages/litert/litert_target_map.cmake"
+if [ -f "$LM_TARGET_MAP" ] && ! grep -q 'gemma-server: dropped stale cc_options' "$LM_TARGET_MAP"; then
+    python3 - "$LM_TARGET_MAP" <<'PY' && info "Dropped stale litert::cc_options target-map entry."
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+# Remove the whole "litert::cc_options=...liblitert_cc_options.a" list element line.
+s = re.sub(r'\n[ \t]*"litert::cc_options=[^"]*"', '', s)
+s += '\n# gemma-server: dropped stale cc_options entry (folded into litert_cc_api)\n'
+open(p, 'w').write(s)
+PY
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
