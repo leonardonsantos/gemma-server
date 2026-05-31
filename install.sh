@@ -355,6 +355,98 @@ open(p, 'w').write(s)
 PY
 fi
 
+# --- Missing CMake sources (Bazel refactor drift → undefined symbols at link) -
+# Several sources exist in the tree and are compiled by Bazel but are absent from
+# the CMake target lists, so the final link of litert_lm_main fails with
+# "undefined symbol". The super-build auto-links EVERY add_litertlm_library
+# STATIC archive into litert_lm_main (via LiteRTLM::Local::Aggregate), so simply
+# compiling each orphaned source into its own STATIC target pulls the symbols in
+# — no need to touch the factories/facades that consume them. Missing sources:
+#   * runtime/engine/cpu_affinity_utils.cc            (IsPixelTensorDevice, …)
+#   * runtime/conversation/channel_util.cc            (GetOpenChannelName, …)
+#   * runtime/components/preprocessor/image_preprocessor_utils.cc (GetAspectRatioPreservingSize)
+#   * runtime/conversation/model_data_processor/gemma4_data_processor.cc  (Gemma4DataProcessor::Create)
+#   * runtime/conversation/model_data_processor/fastvlm_data_processor.cc (FastVlmDataProcessor::Create)
+if ! grep -rq 'gemma-server: compile orphaned source' "$SRC_DIR/runtime" 2>/dev/null; then
+    python3 - "$SRC_DIR" <<'PY' && info "Added orphaned CMake sources needed by litert_lm_main."
+import os, sys
+root = sys.argv[1]
+MARK = '# gemma-server: compile orphaned source'
+
+def add_static(rel_cml, target, src, deps):
+    p = os.path.join(root, rel_cml)
+    if not os.path.isfile(p):
+        return
+    s = open(p).read()
+    if f'add_litertlm_library({target}' in s or f'add_library({target}' in s:
+        return  # already defined (by us on a prior run, or upstream caught up)
+    block = (
+        f'\n{MARK} ({src})\n'
+        f'add_litertlm_library({target} STATIC\n  {src}\n)\n'
+        f'target_include_directories({target}\n'
+        f'  PUBLIC\n    ${{GENERATED_SRC_DIR}}\n    ${{LITERTLM_INCLUDE_PATHS}}\n)\n'
+        f'target_link_libraries({target}\n  PUBLIC\n{deps}\n)\n'
+    )
+    open(p, 'a').write(block)
+
+# Data processors mirror the (working) gemma3 processor's dependency set.
+PROC_DEPS = """    runtime_conversation_io_types
+    runtime_engine_io_types
+    LiteRTLM::Runtime::Conversation::Processor::Gemma3Config
+    LiteRTLM::Runtime::Components::Tokenizer::Interface
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::Constraint
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::ConstraintProvider
+    LiteRTLM::Runtime::Components::Preprocessor::Audio
+    LiteRTLM::Runtime::Components::Preprocessor::AudioMiniAudio
+    LiteRTLM::Runtime::Components::Preprocessor::Image
+    LiteRTLM::Runtime::Components::Preprocessor::StbImage
+    LiteRTLM::Runtime::Components::ToolUse::ParserUtils
+    LiteRTLM::Runtime::Components::ToolUse::PythonFormatUtils
+    runtime_util_litert_status_util
+    runtime_util_memory_mapped_file
+    LiteRTLM::Runtime::Conversation::Processor::DataUtils
+    LiteRTLM::Runtime::Conversation::Processor::Interface
+    LITERTLM_DEPS"""
+
+add_static('runtime/engine/CMakeLists.txt',
+           'runtime_engine_cpu_affinity_utils', 'cpu_affinity_utils.cc',
+           '    runtime_util_litert_status_util\n    LITERTLM_DEPS')
+add_static('runtime/conversation/CMakeLists.txt',
+           'runtime_conversation_channel_util', 'channel_util.cc',
+           '    runtime_conversation_io_types\n    runtime_engine_io_types\n    LITERTLM_DEPS')
+add_static('runtime/components/preprocessor/CMakeLists.txt',
+           'runtime_components_preprocessor_image_preprocessor_utils', 'image_preprocessor_utils.cc',
+           '    runtime_components_preprocessor_image_preprocessor\n    LITERTLM_DEPS')
+add_static('runtime/conversation/model_data_processor/CMakeLists.txt',
+           'runtime_conversation_model_data_processor_gemma4_data_processor', 'gemma4_data_processor.cc',
+           PROC_DEPS)
+add_static('runtime/conversation/model_data_processor/CMakeLists.txt',
+           'runtime_conversation_model_data_processor_fastvlm_data_processor', 'fastvlm_data_processor.cc',
+           PROC_DEPS)
+PY
+fi
+
+# The prebuilt Gemma constraint-provider .so is imported as a CMake target, but
+# litert_lm_main links the *flattened list of archive paths* in the local
+# aggregate, which does not follow that target's transitive interface — so the
+# .so never reaches the link line and LiteRtLmGemmaModelConstraintProvider_*
+# stay undefined. Add the .so explicitly to litert_lm_main's link (inside the
+# --start-group/--end-group, so the static processors that call it resolve).
+LM_PKG_CML="$SRC_DIR/cmake/packages/litert_lm/CMakeLists.txt"
+if [ -f "$LM_PKG_CML" ] && ! grep -q 'gemma-server: link prebuilt provider' "$LM_PKG_CML"; then
+    python3 - "$LM_PKG_CML" "$GEMMA_PREBUILT_REL" <<'PY' && info "Linked prebuilt provider .so into litert_lm_main."
+import sys
+p, rel = sys.argv[1], sys.argv[2]
+s = open(p).read()
+needle = '        ${_LITERTLM_SYSLIBS}'
+ins = ('        # gemma-server: link prebuilt provider\n'
+       f'        "${{LITERTLM_PROJECT_ROOT}}/{rel}"\n')
+if needle in s:
+    s = s.replace(needle, ins + needle, 1)
+    open(p, 'w').write(s)
+PY
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
