@@ -447,6 +447,97 @@ if needle in s:
 PY
 fi
 
+# --- Bypass Abseil flag parsing in litert_lm_main.cc -------------------------
+# litert_lm_main uses ABSL_FLAG + absl::ParseCommandLine. At runtime,
+# libGemmaModelConstraintProvider.so (a direct link dependency) embeds its own
+# statically-compiled Abseil. This creates two separate FlagRegistry instances:
+# the binary's ABSL_FLAG registrations go to one; absl::ParseCommandLine reads
+# from the other → every flag is "Unknown". The fix is to replace Abseil flag
+# parsing with a simple manual argv parser for the 4 flags litert_lm_main needs.
+# A marker file ($BYPASS_MARKER) tracks whether the current binary in the build
+# dir was compiled with the patch, so subsequent re-runs only rebuild if needed.
+MAIN_CC="$SRC_DIR/runtime/engine/litert_lm_main.cc"
+BYPASS_MARKER="$GEMMA_HOME/.litert_lm_main_patched_v1"
+NEED_REBUILD_MAIN=0
+if [ -f "$MAIN_CC" ] && ! grep -q 'gemma-server.*bypass-absl-flags' "$MAIN_CC"; then
+    python3 - "$MAIN_CC" <<'BYPASS_PY'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    src = f.read()
+# 1. Remove absl/flags includes (keep absl/log/* for SetMinLogLevel etc.)
+src = src.replace(
+    '#include "absl/flags/flag.h"  // from @com_google_absl\n', '')
+src = src.replace(
+    '#include "absl/flags/parse.h"  // from @com_google_absl\n', '')
+# 2. Replace the 4 ABSL_FLAG definitions with static globals + manual parser.
+old_flags = (
+    'ABSL_FLAG(std::string, backend, "gpu",\n'
+    '          "Executor backend to use for LLM execution (cpu, gpu, etc.)");\n'
+    'ABSL_FLAG(std::string, model_path, "", "Model path to use for LLM execution.");\n'
+    'ABSL_FLAG(std::string, input_prompt, "",\n'
+    '          "Input prompt to use for testing LLM execution.");\n'
+    'ABSL_FLAG(std::string, input_prompt_file, "", "File path to the input prompt.");\n'
+)
+new_flags = (
+    '// [gemma-server bypass-absl-flags] Manual argv parsing replaces ABSL_FLAG\n'
+    '// to avoid Abseil FlagRegistry conflicts when libGemmaModelConstraintProvider.so\n'
+    '// (which embeds its own statically-linked Abseil) is a direct runtime dep.\n'
+    'static std::string gs_main_model_path;\n'
+    'static std::string gs_main_backend = "cpu";\n'
+    'static std::string gs_main_input_prompt;\n'
+    'static std::string gs_main_input_prompt_file;\n'
+    '\n'
+    'static void ParseMainArgs(int argc, char** argv) {\n'
+    '  for (int i = 1; i < argc; ++i) {\n'
+    '    std::string a(argv[i]);\n'
+    '    if (a.rfind("--model_path=", 0) == 0)\n'
+    '      gs_main_model_path = a.substr(13);\n'
+    '    else if (a.rfind("--backend=", 0) == 0)\n'
+    '      gs_main_backend = a.substr(10);\n'
+    '    else if (a.rfind("--input_prompt=", 0) == 0)\n'
+    '      gs_main_input_prompt = a.substr(15);\n'
+    '    else if (a.rfind("--input_prompt_file=", 0) == 0)\n'
+    '      gs_main_input_prompt_file = a.substr(20);\n'
+    '  }\n'
+    '}\n'
+)
+if old_flags not in src:
+    print("ERROR: ABSL_FLAG block not found in " + path, file=sys.stderr)
+    sys.exit(1)
+src = src.replace(old_flags, new_flags, 1)
+# 3. Patch GetInputPrompt() to use globals.
+src = src.replace(
+    '  const std::string input_prompt = absl::GetFlag(FLAGS_input_prompt);\n'
+    '  const std::string input_prompt_file = absl::GetFlag(FLAGS_input_prompt_file);\n',
+    '  const std::string input_prompt = gs_main_input_prompt;\n'
+    '  const std::string input_prompt_file = gs_main_input_prompt_file;\n')
+# 4. Patch MainHelper() to use ParseMainArgs and globals.
+src = src.replace(
+    '  absl::ParseCommandLine(argc, argv);\n',
+    '  ParseMainArgs(argc, argv);\n')
+src = src.replace(
+    '  const std::string model_path = absl::GetFlag(FLAGS_model_path);\n',
+    '  const std::string model_path = gs_main_model_path;\n')
+src = src.replace(
+    '  auto backend_str = absl::GetFlag(FLAGS_backend);\n',
+    '  auto backend_str = gs_main_backend;\n')
+with open(path, 'w') as f:
+    f.write(src)
+print("Patched litert_lm_main.cc: Abseil flag parsing replaced with ParseMainArgs.")
+BYPASS_PY
+    if [ ! -f "$BYPASS_MARKER" ]; then
+        NEED_REBUILD_MAIN=1
+        # Binary in build dir (if any) was compiled without the patch — remove it
+        # so find_built_binary returns empty and the build runs below.
+        find "$BUILD_DIR" -name 'litert_lm_main' -type f -delete 2>/dev/null || true
+        find "$BUILD_DIR" -name 'litert_lm_main.cc.o' -delete 2>/dev/null || true
+        info "bypass-absl-flags patch applied for first time — binary rebuild required."
+    else
+        info "bypass-absl-flags patch re-applied after git reset (binary already correct)."
+    fi
+fi
+
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
@@ -454,21 +545,12 @@ fi
 # build the default target and then locate the binary inside the sub-build tree.
 step "Building litert_lm (orchestrator → litert_lm_main; can take several hours)"
 
-# Always force a recompile of litert_lm_main.cc before the build.
-# `git reset --hard` does not update file mtimes when content is unchanged, so
-# Make would consider the old .cc.o up-to-date and skip recompilation — leaving
-# Abseil flag registrations from a prior (possibly partial) build in the binary.
-# Delete the stale .cc.o and touch the source to guarantee a fresh compile.
-# NOTE: do NOT delete the binary here — we check it below for the skip path.
-find "$BUILD_DIR" -name 'litert_lm_main.cc.o' -delete 2>/dev/null || true
-touch "$SRC_DIR/runtime/engine/litert_lm_main.cc" 2>/dev/null || true
-
 find_built_binary() {
     find "$BUILD_DIR" -type f -name litert_lm_main 2>/dev/null | head -n1
 }
 
 EXISTING_BIN="$(find_built_binary || true)"
-if [ -n "$EXISTING_BIN" ] && [ "$REBUILD" != "1" ]; then
+if [ -n "$EXISTING_BIN" ] && [ "$REBUILD" != "1" ] && [ "$NEED_REBUILD_MAIN" != "1" ]; then
     info "Binary already built — skipping (set REBUILD=1 to force a rebuild)."
 else
     # --- Native host-tool wiring -------------------------------------------------
@@ -592,6 +674,7 @@ cp -f "$BUILT_BIN" "$SERVER_BIN"
 chmod +x "$SERVER_BIN"
 info "Native binary built at: $BUILT_BIN"
 info "Native binary installed: $SERVER_BIN"
+touch "$BYPASS_MARKER"  # Record that this binary was built with bypass-absl-flags patch.
 
 # Install the prebuilt provider .so beside the binary so it loads at runtime
 # (the binary links it; without it on the loader path the server won't start).
@@ -601,42 +684,17 @@ if [ -f "$SRC_DIR/$GEMMA_PREBUILT_REL" ]; then
         && info "Runtime lib installed: $LIB_DIR/$GEMMA_PREBUILT_SO"
 fi
 
-# Self-test: verify the installed binary recognises its Abseil flags.
-# Pass --model_path=/dev/null so Abseil parses all flags; the binary then
-# fails with "Model path is empty" or a model-loading error — both acceptable
-# (they prove the flags are registered).  "Unknown command line flag" means the
-# flag-registration static initialisers didn't run (stale .cc.o) — force a
-# clean recompile of litert_lm_main.cc and re-link.
-_selftest() {
-    LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        timeout 10 "$SERVER_BIN" \
-            --model_path=/dev/null --backend=cpu \
-            --input_prompt_file=/dev/null 2>&1 || true
-}
-_test_out="$(_selftest)"
-if echo "$_test_out" | grep -q 'Unknown command line flag'; then
-    warn "Binary self-test: Abseil flags not registered (stale .cc.o)."
-    warn "Forcing clean recompile of litert_lm_main.cc …"
-    find "$BUILD_DIR" -name 'litert_lm_main.cc.o' -delete 2>/dev/null || true
-    find "$BUILD_DIR" -name 'litert_lm_main'       -type f -delete 2>/dev/null || true
-    touch "$SRC_DIR/runtime/engine/litert_lm_main.cc"
-    BUILD_LOG="$GEMMA_HOME/build.log"
-    if cmake --build "$BUILD_DIR" -j"${BUILD_JOBS}" 2>&1 | tee -a "$BUILD_LOG"; then
-        BUILT_BIN="$(find_built_binary || true)"
-        if [ -n "$BUILT_BIN" ]; then
-            cp -f "$BUILT_BIN" "$SERVER_BIN"
-            chmod +x "$SERVER_BIN"
-            info "Binary replaced after forced recompile: $SERVER_BIN"
-            _test_out2="$(_selftest)"
-            if echo "$_test_out2" | grep -q 'Unknown command line flag'; then
-                error "Binary still rejects flags after forced recompile. Output: $_test_out2"
-            fi
-        fi
-    else
-        warn "Forced recompile failed — see $BUILD_LOG for details."
+# Sanity-check: the binary must accept --model_path without complaining about
+# unknown flags (the bypass-absl-flags patch should make this always pass).
+if command -v timeout >/dev/null 2>&1; then
+    _st_out="$(LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        timeout 15 "$SERVER_BIN" --model_path=/dev/null --backend=cpu 2>&1 || true)"
+    if echo "$_st_out" | grep -q 'Unknown command line flag'; then
+        error "Binary still rejects --model_path after bypass patch. Check build log at $GEMMA_HOME/build.log."
     fi
+    info "Binary sanity check passed (flags accepted)."
 else
-    info "Binary self-test passed (flags accepted)."
+    info "Binary sanity check skipped (timeout not available — install util-linux if needed)."
 fi
 
 # ── 4. Download the model ────────────────────────────────────────────────────
