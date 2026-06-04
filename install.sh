@@ -447,177 +447,6 @@ if needle in s:
 PY
 fi
 
-# --- Force engine registration TU inclusion via explicit symbol reference -----
-# On Android without --whole-archive, the linker drops any object file that
-# defines no externally-referenced symbol. engine_advanced_impl.cc contains ONLY
-# a static-storage EngineRegisterer (LITERT_LM_REGISTER_ENGINE macro), so the
-# linker silently discards the TU and EngineFactory's registry stays empty.
-# Fix: add a no-op extern "C" function to engine_advanced_impl.cc, then
-# reference it from litert_lm_main.cc to force the TU into the link.
-ENGINE_IMPL_CC="$SRC_DIR/runtime/core/engine_advanced_impl.cc"
-if [ -f "$ENGINE_IMPL_CC" ] && ! grep -q 'gemma-server.*force-engine-reg' "$ENGINE_IMPL_CC"; then
-    python3 - "$ENGINE_IMPL_CC" <<'PY' && info "Added engine-reg anchor to engine_advanced_impl.cc."
-import sys
-p = sys.argv[1]
-s = open(p).read()
-stub = (
-    '\n// [gemma-server force-engine-reg] Stub with external linkage so that\n'
-    '// litert_lm_main.cc can reference this TU, preventing the Android linker\n'
-    '// from discarding engine_advanced_impl.cc.o (and its static EngineRegisterer).\n'
-    'extern "C" void LiteRtLmForceAdvancedEngineRegistration() {}\n'
-)
-closing = '}  // namespace litert::lm'
-if closing in s and stub not in s:
-    s = s.replace(closing, stub + closing, 1)
-    open(p, 'w').write(s)
-PY
-fi
-
-# --- Enable --whole-archive on Android for engine static initializers --------
-# Belt-and-suspenders: also patch the CMakeLists.txt Android linker-flag block
-# to use --whole-archive (matching the Linux branch). This forces all TUs from
-# the ODML payload into the final link, including any other files with only
-# static initializers. The explicit symbol reference above is the primary fix;
-# --whole-archive is the secondary guarantee.
-# NOTE: this CMakeLists.txt change requires a binary rebuild to take effect.
-# The bypass-absl-flags patch version bump below (v1 → v2) ensures the binary
-# is rebuilt unconditionally whenever the engine-reg or whole-archive fix is
-# applied for the first time on this device.
-if [ -f "$LM_PKG_CML" ] && ! grep -q 'gemma-server: android whole-archive' "$LM_PKG_CML"; then
-    python3 - "$LM_PKG_CML" <<'PY' && info "Enabled --whole-archive for Android engine registration."
-import sys
-p = sys.argv[1]
-s = open(p).read()
-# Find the Android branch (no _LITERTLM_LINK_WHOLE_START/_END set) and add them.
-old = (
-    '    elseif(ANDROID)\n'
-    '        # Android / Bionic (NO standalone rt or pthread)\n'
-    '        set(_LITERTLM_LINK_MULTIDEF "-Wl,--allow-multiple-definition")\n'
-    '        set(_LITERTLM_LINK_GROUP_START "-Wl,--start-group")\n'
-    '        set(_LITERTLM_LINK_GROUP_END "-Wl,--end-group")\n'
-    '        set(_LITERTLM_SYSLIBS "-lz -ldl -llog")'
-)
-new = (
-    '    elseif(ANDROID)\n'
-    '        # Android / Bionic (NO standalone rt or pthread)\n'
-    '        set(_LITERTLM_LINK_MULTIDEF "-Wl,--allow-multiple-definition")\n'
-    '        set(_LITERTLM_LINK_GROUP_START "-Wl,--start-group")\n'
-    '        set(_LITERTLM_LINK_GROUP_END "-Wl,--end-group")\n'
-    '        # gemma-server: android whole-archive (force static initializers to run)\n'
-    '        set(_LITERTLM_LINK_WHOLE_START "-Wl,--whole-archive")\n'
-    '        set(_LITERTLM_LINK_WHOLE_END "-Wl,--no-whole-archive")\n'
-    '        set(_LITERTLM_SYSLIBS "-lz -ldl -llog")'
-)
-if old in s:
-    open(p, 'w').write(s.replace(old, new, 1))
-else:
-    print(f'WARNING: Android branch not found verbatim in {p}; skipping patch')
-PY
-fi
-
-# --- Bypass Abseil flag parsing in litert_lm_main.cc -------------------------
-# litert_lm_main uses ABSL_FLAG + absl::ParseCommandLine. At runtime,
-# libGemmaModelConstraintProvider.so (a direct link dependency) embeds its own
-# statically-compiled Abseil. This creates two separate FlagRegistry instances:
-# the binary's ABSL_FLAG registrations go to one; absl::ParseCommandLine reads
-# from the other → every flag is "Unknown". The fix is to replace Abseil flag
-# parsing with a simple manual argv parser for the 4 flags litert_lm_main needs.
-# A marker file ($BYPASS_MARKER) tracks whether the current binary in the build
-# dir was compiled with the patch, so subsequent re-runs only rebuild if needed.
-MAIN_CC="$SRC_DIR/runtime/engine/litert_lm_main.cc"
-BYPASS_MARKER="$GEMMA_HOME/.litert_lm_main_patched_v2"
-# If only the old v1 marker exists (no engine-reg fix), delete it so the v2
-# patch is treated as new → forces a rebuild with the engine reference added.
-[ -f "$GEMMA_HOME/.litert_lm_main_patched_v1" ] && \
-    ! [ -f "$BYPASS_MARKER" ] && \
-    rm -f "$GEMMA_HOME/.litert_lm_main_patched_v1" && \
-    info "Removed stale v1 bypass marker — v2 rebuild required."
-NEED_REBUILD_MAIN=0
-if [ -f "$MAIN_CC" ] && ! grep -q 'gemma-server.*bypass-absl-flags' "$MAIN_CC"; then
-    python3 - "$MAIN_CC" <<'BYPASS_PY'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    src = f.read()
-# 1. Remove absl/flags includes (keep absl/log/* for SetMinLogLevel etc.)
-src = src.replace(
-    '#include "absl/flags/flag.h"  // from @com_google_absl\n', '')
-src = src.replace(
-    '#include "absl/flags/parse.h"  // from @com_google_absl\n', '')
-# 2. Replace the 4 ABSL_FLAG definitions with static globals + manual parser.
-old_flags = (
-    'ABSL_FLAG(std::string, backend, "gpu",\n'
-    '          "Executor backend to use for LLM execution (cpu, gpu, etc.)");\n'
-    'ABSL_FLAG(std::string, model_path, "", "Model path to use for LLM execution.");\n'
-    'ABSL_FLAG(std::string, input_prompt, "",\n'
-    '          "Input prompt to use for testing LLM execution.");\n'
-    'ABSL_FLAG(std::string, input_prompt_file, "", "File path to the input prompt.");\n'
-)
-new_flags = (
-    '// [gemma-server bypass-absl-flags] Manual argv parsing replaces ABSL_FLAG\n'
-    '// to avoid Abseil FlagRegistry conflicts when libGemmaModelConstraintProvider.so\n'
-    '// (which embeds its own statically-linked Abseil) is a direct runtime dep.\n'
-    'static std::string gs_main_model_path;\n'
-    'static std::string gs_main_backend = "cpu";\n'
-    'static std::string gs_main_input_prompt;\n'
-    'static std::string gs_main_input_prompt_file;\n'
-    '\n'
-    '// [gemma-server force-engine-reg] Reference the stub in engine_advanced_impl.cc\n'
-    '// so the Android linker cannot drop that TU (and its EngineRegisterer initializer).\n'
-    'extern "C" void LiteRtLmForceAdvancedEngineRegistration();\n'
-    'static void (* const _litert_engine_reg_anchor)() __attribute__((used))\n'
-    '    = LiteRtLmForceAdvancedEngineRegistration;\n'
-    '\n'
-    'static void ParseMainArgs(int argc, char** argv) {\n'
-    '  for (int i = 1; i < argc; ++i) {\n'
-    '    std::string a(argv[i]);\n'
-    '    if (a.rfind("--model_path=", 0) == 0)\n'
-    '      gs_main_model_path = a.substr(13);\n'
-    '    else if (a.rfind("--backend=", 0) == 0)\n'
-    '      gs_main_backend = a.substr(10);\n'
-    '    else if (a.rfind("--input_prompt=", 0) == 0)\n'
-    '      gs_main_input_prompt = a.substr(15);\n'
-    '    else if (a.rfind("--input_prompt_file=", 0) == 0)\n'
-    '      gs_main_input_prompt_file = a.substr(20);\n'
-    '  }\n'
-    '}\n'
-)
-if old_flags not in src:
-    print("ERROR: ABSL_FLAG block not found in " + path, file=sys.stderr)
-    sys.exit(1)
-src = src.replace(old_flags, new_flags, 1)
-# 3. Patch GetInputPrompt() to use globals.
-src = src.replace(
-    '  const std::string input_prompt = absl::GetFlag(FLAGS_input_prompt);\n'
-    '  const std::string input_prompt_file = absl::GetFlag(FLAGS_input_prompt_file);\n',
-    '  const std::string input_prompt = gs_main_input_prompt;\n'
-    '  const std::string input_prompt_file = gs_main_input_prompt_file;\n')
-# 4. Patch MainHelper() to use ParseMainArgs and globals.
-src = src.replace(
-    '  absl::ParseCommandLine(argc, argv);\n',
-    '  ParseMainArgs(argc, argv);\n')
-src = src.replace(
-    '  const std::string model_path = absl::GetFlag(FLAGS_model_path);\n',
-    '  const std::string model_path = gs_main_model_path;\n')
-src = src.replace(
-    '  auto backend_str = absl::GetFlag(FLAGS_backend);\n',
-    '  auto backend_str = gs_main_backend;\n')
-with open(path, 'w') as f:
-    f.write(src)
-print("Patched litert_lm_main.cc: Abseil flag parsing replaced with ParseMainArgs.")
-BYPASS_PY
-    if [ ! -f "$BYPASS_MARKER" ]; then
-        NEED_REBUILD_MAIN=1
-        # Binary in build dir (if any) was compiled without the patch — remove it
-        # so find_built_binary returns empty and the build runs below.
-        find "$BUILD_DIR" -name 'litert_lm_main' -type f -delete 2>/dev/null || true
-        find "$BUILD_DIR" -name 'litert_lm_main.cc.o' -delete 2>/dev/null || true
-        info "bypass-absl-flags patch applied for first time — binary rebuild required."
-    else
-        info "bypass-absl-flags patch re-applied after git reset (binary already correct)."
-    fi
-fi
-
 # ── 3. Build the native binary ───────────────────────────────────────────────
 # The top-level CMake project is an *orchestrator*: it wraps the real build in an
 # ExternalProject named `litert_lm`. There is no top-level `litert_lm_main`
@@ -630,7 +459,7 @@ find_built_binary() {
 }
 
 EXISTING_BIN="$(find_built_binary || true)"
-if [ -n "$EXISTING_BIN" ] && [ "$REBUILD" != "1" ] && [ "$NEED_REBUILD_MAIN" != "1" ]; then
+if [ -n "$EXISTING_BIN" ] && [ "$REBUILD" != "1" ]; then
     info "Binary already built — skipping (set REBUILD=1 to force a rebuild)."
 else
     # --- Native host-tool wiring -------------------------------------------------
@@ -754,7 +583,6 @@ cp -f "$BUILT_BIN" "$SERVER_BIN"
 chmod +x "$SERVER_BIN"
 info "Native binary built at: $BUILT_BIN"
 info "Native binary installed: $SERVER_BIN"
-touch "$BYPASS_MARKER"  # Record that this binary was built with bypass-absl-flags patch.
 
 # Install the prebuilt provider .so beside the binary so it loads at runtime
 # (the binary links it; without it on the loader path the server won't start).
@@ -762,19 +590,6 @@ mkdir -p "$LIB_DIR"
 if [ -f "$SRC_DIR/$GEMMA_PREBUILT_REL" ]; then
     cp -f "$SRC_DIR/$GEMMA_PREBUILT_REL" "$LIB_DIR/" \
         && info "Runtime lib installed: $LIB_DIR/$GEMMA_PREBUILT_SO"
-fi
-
-# Sanity-check: the binary must accept --model_path without complaining about
-# unknown flags (the bypass-absl-flags patch should make this always pass).
-if command -v timeout >/dev/null 2>&1; then
-    _st_out="$(LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        timeout 15 "$SERVER_BIN" --model_path=/dev/null --backend=cpu 2>&1 || true)"
-    if echo "$_st_out" | grep -q 'Unknown command line flag'; then
-        error "Binary still rejects --model_path after bypass patch. Check build log at $GEMMA_HOME/build.log."
-    fi
-    info "Binary sanity check passed (flags accepted)."
-else
-    info "Binary sanity check skipped (timeout not available — install util-linux if needed)."
 fi
 
 # ── 4. Download the model ────────────────────────────────────────────────────
