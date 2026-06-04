@@ -447,6 +447,49 @@ if needle in s:
 PY
 fi
 
+# --- Enable --whole-archive on Android for engine static initializers --------
+# On Linux, the ODML payload (which includes all local STATIC archives compiled
+# from add_litertlm_library) is wrapped in --whole-archive/--no-whole-archive,
+# which forces ALL object files into the final link — including those containing
+# only static initializers, such as the LITERT_LM_REGISTER_ENGINE registration
+# in engine_advanced_impl.cc. Without this, the Android linker silently drops
+# object files whose symbols are never referenced from outside the TU, so the
+# EngineFactory registry stays empty and every request fails with:
+#   NOT_FOUND: No available engine for backend: CPU.
+# The fix: add the same --whole-archive flags to the Android (ANDROID) branch in
+# cmake/packages/litert_lm/CMakeLists.txt that are already set for Linux.
+if [ -f "$LM_PKG_CML" ] && ! grep -q 'gemma-server: android whole-archive' "$LM_PKG_CML"; then
+    python3 - "$LM_PKG_CML" <<'PY' && info "Enabled --whole-archive for Android engine registration."
+import sys
+p = sys.argv[1]
+s = open(p).read()
+# Find the Android branch (no _LITERTLM_LINK_WHOLE_START/_END set) and add them.
+old = (
+    '    elseif(ANDROID)\n'
+    '        # Android / Bionic (NO standalone rt or pthread)\n'
+    '        set(_LITERTLM_LINK_MULTIDEF "-Wl,--allow-multiple-definition")\n'
+    '        set(_LITERTLM_LINK_GROUP_START "-Wl,--start-group")\n'
+    '        set(_LITERTLM_LINK_GROUP_END "-Wl,--end-group")\n'
+    '        set(_LITERTLM_SYSLIBS "-lz -ldl -llog")'
+)
+new = (
+    '    elseif(ANDROID)\n'
+    '        # Android / Bionic (NO standalone rt or pthread)\n'
+    '        set(_LITERTLM_LINK_MULTIDEF "-Wl,--allow-multiple-definition")\n'
+    '        set(_LITERTLM_LINK_GROUP_START "-Wl,--start-group")\n'
+    '        set(_LITERTLM_LINK_GROUP_END "-Wl,--end-group")\n'
+    '        # gemma-server: android whole-archive (force static initializers to run)\n'
+    '        set(_LITERTLM_LINK_WHOLE_START "-Wl,--whole-archive")\n'
+    '        set(_LITERTLM_LINK_WHOLE_END "-Wl,--no-whole-archive")\n'
+    '        set(_LITERTLM_SYSLIBS "-lz -ldl -llog")'
+)
+if old in s:
+    open(p, 'w').write(s.replace(old, new, 1))
+else:
+    print(f'WARNING: Android branch not found verbatim in {p}; skipping patch')
+PY
+fi
+
 # --- Bypass Abseil flag parsing in litert_lm_main.cc -------------------------
 # litert_lm_main uses ABSL_FLAG + absl::ParseCommandLine. At runtime,
 # libGemmaModelConstraintProvider.so (a direct link dependency) embeds its own
