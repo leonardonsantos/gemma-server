@@ -447,17 +447,42 @@ if needle in s:
 PY
 fi
 
+# --- Force engine registration TU inclusion via explicit symbol reference -----
+# On Android without --whole-archive, the linker drops any object file that
+# defines no externally-referenced symbol. engine_advanced_impl.cc contains ONLY
+# a static-storage EngineRegisterer (LITERT_LM_REGISTER_ENGINE macro), so the
+# linker silently discards the TU and EngineFactory's registry stays empty.
+# Fix: add a no-op extern "C" function to engine_advanced_impl.cc, then
+# reference it from litert_lm_main.cc to force the TU into the link.
+ENGINE_IMPL_CC="$SRC_DIR/runtime/core/engine_advanced_impl.cc"
+if [ -f "$ENGINE_IMPL_CC" ] && ! grep -q 'gemma-server.*force-engine-reg' "$ENGINE_IMPL_CC"; then
+    python3 - "$ENGINE_IMPL_CC" <<'PY' && info "Added engine-reg anchor to engine_advanced_impl.cc."
+import sys
+p = sys.argv[1]
+s = open(p).read()
+stub = (
+    '\n// [gemma-server force-engine-reg] Stub with external linkage so that\n'
+    '// litert_lm_main.cc can reference this TU, preventing the Android linker\n'
+    '// from discarding engine_advanced_impl.cc.o (and its static EngineRegisterer).\n'
+    'extern "C" void LiteRtLmForceAdvancedEngineRegistration() {}\n'
+)
+closing = '}  // namespace litert::lm'
+if closing in s and stub not in s:
+    s = s.replace(closing, stub + closing, 1)
+    open(p, 'w').write(s)
+PY
+fi
+
 # --- Enable --whole-archive on Android for engine static initializers --------
-# On Linux, the ODML payload (which includes all local STATIC archives compiled
-# from add_litertlm_library) is wrapped in --whole-archive/--no-whole-archive,
-# which forces ALL object files into the final link — including those containing
-# only static initializers, such as the LITERT_LM_REGISTER_ENGINE registration
-# in engine_advanced_impl.cc. Without this, the Android linker silently drops
-# object files whose symbols are never referenced from outside the TU, so the
-# EngineFactory registry stays empty and every request fails with:
-#   NOT_FOUND: No available engine for backend: CPU.
-# The fix: add the same --whole-archive flags to the Android (ANDROID) branch in
-# cmake/packages/litert_lm/CMakeLists.txt that are already set for Linux.
+# Belt-and-suspenders: also patch the CMakeLists.txt Android linker-flag block
+# to use --whole-archive (matching the Linux branch). This forces all TUs from
+# the ODML payload into the final link, including any other files with only
+# static initializers. The explicit symbol reference above is the primary fix;
+# --whole-archive is the secondary guarantee.
+# NOTE: this CMakeLists.txt change requires a binary rebuild to take effect.
+# The bypass-absl-flags patch version bump below (v1 → v2) ensures the binary
+# is rebuilt unconditionally whenever the engine-reg or whole-archive fix is
+# applied for the first time on this device.
 if [ -f "$LM_PKG_CML" ] && ! grep -q 'gemma-server: android whole-archive' "$LM_PKG_CML"; then
     python3 - "$LM_PKG_CML" <<'PY' && info "Enabled --whole-archive for Android engine registration."
 import sys
@@ -500,7 +525,13 @@ fi
 # A marker file ($BYPASS_MARKER) tracks whether the current binary in the build
 # dir was compiled with the patch, so subsequent re-runs only rebuild if needed.
 MAIN_CC="$SRC_DIR/runtime/engine/litert_lm_main.cc"
-BYPASS_MARKER="$GEMMA_HOME/.litert_lm_main_patched_v1"
+BYPASS_MARKER="$GEMMA_HOME/.litert_lm_main_patched_v2"
+# If only the old v1 marker exists (no engine-reg fix), delete it so the v2
+# patch is treated as new → forces a rebuild with the engine reference added.
+[ -f "$GEMMA_HOME/.litert_lm_main_patched_v1" ] && \
+    ! [ -f "$BYPASS_MARKER" ] && \
+    rm -f "$GEMMA_HOME/.litert_lm_main_patched_v1" && \
+    info "Removed stale v1 bypass marker — v2 rebuild required."
 NEED_REBUILD_MAIN=0
 if [ -f "$MAIN_CC" ] && ! grep -q 'gemma-server.*bypass-absl-flags' "$MAIN_CC"; then
     python3 - "$MAIN_CC" <<'BYPASS_PY'
@@ -530,6 +561,12 @@ new_flags = (
     'static std::string gs_main_backend = "cpu";\n'
     'static std::string gs_main_input_prompt;\n'
     'static std::string gs_main_input_prompt_file;\n'
+    '\n'
+    '// [gemma-server force-engine-reg] Reference the stub in engine_advanced_impl.cc\n'
+    '// so the Android linker cannot drop that TU (and its EngineRegisterer initializer).\n'
+    'extern "C" void LiteRtLmForceAdvancedEngineRegistration();\n'
+    'static void (* const _litert_engine_reg_anchor)() __attribute__((used))\n'
+    '    = LiteRtLmForceAdvancedEngineRegistration;\n'
     '\n'
     'static void ParseMainArgs(int argc, char** argv) {\n'
     '  for (int i = 1; i < argc; ++i) {\n'
