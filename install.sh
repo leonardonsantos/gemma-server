@@ -454,6 +454,13 @@ fi
 # build the default target and then locate the binary inside the sub-build tree.
 step "Building litert_lm (orchestrator → litert_lm_main; can take several hours)"
 
+# Always touch litert_lm_main.cc before the build.  `git reset --hard` does not
+# update file mtimes when content is unchanged, so Make would consider the old
+# .cc.o up-to-date and skip recompilation — leaving Abseil flag registrations
+# from a prior (possibly partial) build in the binary.  Touching the source
+# guarantees a fresh compile of main.cc every run.
+touch "$SRC_DIR/runtime/engine/litert_lm_main.cc" 2>/dev/null || true
+
 find_built_binary() {
     find "$BUILD_DIR" -type f -name litert_lm_main 2>/dev/null | head -n1
 }
@@ -590,6 +597,44 @@ mkdir -p "$LIB_DIR"
 if [ -f "$SRC_DIR/$GEMMA_PREBUILT_REL" ]; then
     cp -f "$SRC_DIR/$GEMMA_PREBUILT_REL" "$LIB_DIR/" \
         && info "Runtime lib installed: $LIB_DIR/$GEMMA_PREBUILT_SO"
+fi
+
+# Self-test: verify the installed binary recognises its Abseil flags.
+# Pass --model_path=/dev/null so Abseil parses all flags; the binary then
+# fails with "Model path is empty" or a model-loading error — both acceptable
+# (they prove the flags are registered).  "Unknown command line flag" means the
+# flag-registration static initialisers didn't run (stale .cc.o) — force a
+# clean recompile of litert_lm_main.cc and re-link.
+_selftest() {
+    LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        timeout 10 "$SERVER_BIN" \
+            --model_path=/dev/null --backend=cpu \
+            --input_prompt_file=/dev/null 2>&1 || true
+}
+_test_out="$(_selftest)"
+if echo "$_test_out" | grep -q 'Unknown command line flag'; then
+    warn "Binary self-test: Abseil flags not registered (stale .cc.o)."
+    warn "Forcing clean recompile of litert_lm_main.cc …"
+    find "$BUILD_DIR" -name 'litert_lm_main.cc.o' -delete 2>/dev/null || true
+    find "$BUILD_DIR" -name 'litert_lm_main'       -type f -delete 2>/dev/null || true
+    touch "$SRC_DIR/runtime/engine/litert_lm_main.cc"
+    BUILD_LOG="$GEMMA_HOME/build.log"
+    if cmake --build "$BUILD_DIR" -j"${BUILD_JOBS}" 2>&1 | tee -a "$BUILD_LOG"; then
+        BUILT_BIN="$(find_built_binary || true)"
+        if [ -n "$BUILT_BIN" ]; then
+            cp -f "$BUILT_BIN" "$SERVER_BIN"
+            chmod +x "$SERVER_BIN"
+            info "Binary replaced after forced recompile: $SERVER_BIN"
+            _test_out2="$(_selftest)"
+            if echo "$_test_out2" | grep -q 'Unknown command line flag'; then
+                error "Binary still rejects flags after forced recompile. Output: $_test_out2"
+            fi
+        fi
+    else
+        warn "Forced recompile failed — see $BUILD_LOG for details."
+    fi
+else
+    info "Binary self-test passed (flags accepted)."
 fi
 
 # ── 4. Download the model ────────────────────────────────────────────────────
