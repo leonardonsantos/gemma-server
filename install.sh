@@ -454,11 +454,13 @@ fi
 # build the default target and then locate the binary inside the sub-build tree.
 step "Building litert_lm (orchestrator → litert_lm_main; can take several hours)"
 
-# Always touch litert_lm_main.cc before the build.  `git reset --hard` does not
-# update file mtimes when content is unchanged, so Make would consider the old
-# .cc.o up-to-date and skip recompilation — leaving Abseil flag registrations
-# from a prior (possibly partial) build in the binary.  Touching the source
-# guarantees a fresh compile of main.cc every run.
+# Always force a recompile of litert_lm_main.cc before the build.
+# `git reset --hard` does not update file mtimes when content is unchanged, so
+# Make would consider the old .cc.o up-to-date and skip recompilation — leaving
+# Abseil flag registrations from a prior (possibly partial) build in the binary.
+# Delete the stale .cc.o and touch the source to guarantee a fresh compile.
+# NOTE: do NOT delete the binary here — we check it below for the skip path.
+find "$BUILD_DIR" -name 'litert_lm_main.cc.o' -delete 2>/dev/null || true
 touch "$SRC_DIR/runtime/engine/litert_lm_main.cc" 2>/dev/null || true
 
 find_built_binary() {
